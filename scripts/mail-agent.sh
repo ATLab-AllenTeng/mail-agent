@@ -14,7 +14,19 @@
 set -u
 
 # ── 路徑 ─────────────────────────────────────────────────────────────
-AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 透過 ~/.local/bin/mail-agent 符號連結執行時，BASH_SOURCE 是連結本身，
+# 要先一路解析到真正的腳本位置，才能正確推算專案目錄 (macOS 舊版沒有 readlink -f)
+resolve_link() {
+  local f="$1" d
+  while [ -L "${f}" ]; do
+    d="$(cd "$(dirname "${f}")" && pwd)"
+    f="$(readlink "${f}")"
+    case "${f}" in /*) ;; *) f="${d}/${f}" ;; esac
+  done
+  echo "${f}"
+}
+SCRIPT_PATH="$(resolve_link "${BASH_SOURCE[0]}")"
+AGENT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/.." && pwd)"
 STATE_DIR="${HOME}/.mail-agent"
 LOG_DIR="${STATE_DIR}/logs"
 VENV="${AGENT_DIR}/.venv"
