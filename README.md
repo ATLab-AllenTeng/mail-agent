@@ -18,6 +18,7 @@
 mail-agent/
 ├── run_agent.py          # 主程式：AppleScript 讀信 + LLM 分析
 ├── check_mail.command    # 一鍵啟動檔：雙擊即可在 Terminal 執行
+├── scripts/mail-agent.sh # 安裝與操作腳本：install / run / dry-run / accounts / status / logs
 ├── requirements.txt      # Python 依賴套件
 ├── .env.example          # 設定範本：複製為 .env 後填入 (已加入 .gitignore)
 ├── last_sync.json        # 自動生成：上次執行的時間戳記 (已加入 .gitignore)
@@ -25,6 +26,31 @@ mail-agent/
 ```
 
 ## 安裝
+
+一鍵安裝 (比照 letta.kb 的 `kb.sh`)：
+
+```bash
+cd ~/src/mail-agent && scripts/mail-agent.sh install
+```
+
+它會依序：檢查 Python 3.10+、建立 `.venv` 並安裝依賴、從 `.env.example` 建立 `.env` 並詢問
+帳號、端點、模型與金鑰 (金鑰輸入不回顯，檔案權限 600)、檢查 LLM 端點是否有回應、
+讀取郵件 App 的帳號清單核對 `.env` 的設定，最後在 `~/.local/bin/mail-agent` 建立捷徑。
+可以重複執行，既有設定直接 Enter 保留。
+
+安裝後的日常指令：
+
+| 指令 | 作用 |
+|---|---|
+| `mail-agent run [參數]` | 執行一次郵件幕僚，輸出同時存到 `~/.mail-agent/logs/` |
+| `mail-agent dry-run [參數]` | 只列出會處理的信件，不讀內文、不呼叫 LLM、不更新時間戳 |
+| `mail-agent accounts` | 列出郵件 App 的帳號名稱 |
+| `mail-agent mailboxes` | 列出 `.env` 所設帳號底下的信箱名稱 |
+| `mail-agent status` | venv、.env、設定摘要 (金鑰只顯示末四碼)、LLM 端點、上次同步時間、最近一次執行 |
+| `mail-agent logs [-f]` | 最近一次執行的輸出 |
+| `mail-agent key` | 只更換 API 金鑰，不必重跑 install |
+
+手動安裝也可以：
 
 ```bash
 cd ~/src/mail-agent
@@ -80,6 +106,12 @@ MAIL_AGENT_MODEL=Mail-Briefing
 ## 執行
 
 雙擊 `check_mail.command`，或在終端機：
+
+```bash
+mail-agent run
+```
+
+不經腳本直接執行也可以：
 
 ```bash
 .venv/bin/python run_agent.py
