@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "last_sync.json"
 
-# 郵件 App 側邊欄顯示的公司帳號名稱；可用環境變數 MAIL_AGENT_ACCOUNT 覆寫
+# 郵件 App 側邊欄顯示的公司帳號名稱；多個帳號以逗號分隔，可用環境變數 MAIL_AGENT_ACCOUNT 覆寫
 TARGET_ACCOUNT = os.environ.get("MAIL_AGENT_ACCOUNT", "Exchange")
 TARGET_MAILBOX = os.environ.get("MAIL_AGENT_MAILBOX", "INBOX")
 
@@ -265,12 +265,26 @@ def print_raw_mails(mails: List[dict]) -> None:
 # ---------------------------------------------------------------------------
 # 主執行流程
 # ---------------------------------------------------------------------------
+def split_accounts(value: str) -> List[str]:
+    """把逗號分隔的帳號字串拆成清單，去除空白與重複。"""
+    seen: List[str] = []
+    for name in value.split(","):
+        name = name.strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="macOS Mail Agent — Exchange 郵件 AI 幕僚")
     parser.add_argument("--list-accounts", action="store_true", help="列出郵件 App 中的帳號名稱後結束")
     parser.add_argument("--dry-run", action="store_true", help="只抓取信件並列出，不呼叫 LLM、不更新時間戳")
     parser.add_argument("--all", action="store_true", help="忽略上次執行時間，掃描所有無旗標信件")
-    parser.add_argument("--account", default=TARGET_ACCOUNT, help=f"郵件帳號名稱 (預設: {TARGET_ACCOUNT})")
+    parser.add_argument(
+        "--account",
+        default=TARGET_ACCOUNT,
+        help=f"郵件帳號名稱，多個以逗號分隔 (預設: {TARGET_ACCOUNT})",
+    )
     return parser.parse_args(argv)
 
 
@@ -298,39 +312,58 @@ def main(argv: Optional[List[str]] = None) -> int:
         + (last_sync.strftime(TIME_FORMAT) if last_sync else "無紀錄 (將掃描所有無旗標信件)")
     )
 
+    accounts = split_accounts(args.account)
+    if not accounts:
+        print("❌ 未指定任何帳號")
+        return 1
+
     # 在抓信「之前」記下本次時間點，避免漏掉執行期間抵達的信件
     run_started_at = datetime.now().replace(microsecond=0)
 
-    print(f"📥 正在讀取 [{args.account}] 帳號的收件夾 ({TARGET_MAILBOX})...")
-    try:
-        raw_mails = fetch_unflagged_inbox_mails(args.account, since=last_sync)
-    except RuntimeError as e:
-        print(f"❌ 讀取郵件失敗: {e}")
-        print("   提示: 請確認已允許 Terminal 控制「郵件」，並用 --list-accounts 確認帳號名稱。")
-        return 1
+    # 先把所有帳號的信都抓完，再進行分析
+    mails_by_account: List[tuple[str, List[dict]]] = []
+    for account in accounts:
+        print(f"📥 正在讀取 [{account}] 帳號的收件夾 ({TARGET_MAILBOX})...")
+        try:
+            mails = fetch_unflagged_inbox_mails(account, since=last_sync)
+        except RuntimeError as e:
+            print(f"❌ 讀取 [{account}] 郵件失敗: {e}")
+            print("   提示: 請確認已允許 Terminal 控制「郵件」，並用 --list-accounts 確認帳號名稱。")
+            return 1
+        print(f"   找到 {len(mails)} 封未標記旗標的新信件")
+        if mails:
+            mails_by_account.append((account, mails))
 
-    if not raw_mails:
+    total = sum(len(m) for _, m in mails_by_account)
+    if total == 0:
         print("✨ 目前收件夾沒有需要處理的新信件！")
         return 0
 
-    print(f"🔍 掃描到 {len(raw_mails)} 封未標記旗標的信件" + ("" if args.dry_run else "，正在進行 AI 幕僚分析..."))
+    print(f"🔍 共掃描到 {total} 封未標記旗標的信件" + ("" if args.dry_run else "，正在進行 AI 幕僚分析..."))
 
     if args.dry_run:
-        print_raw_mails(raw_mails)
+        for account, mails in mails_by_account:
+            print(f"\n📮 帳號: {account} ({len(mails)} 封)")
+            print_raw_mails(mails)
         print("\n(dry-run 模式：未呼叫 LLM，也未更新同步時間點)")
         return 0
 
-    try:
-        report = analyze_emails_with_llm(raw_mails)
-    except Exception as e:
-        print(f"❌ 執行過程發生錯誤: {e}")
-        return 1
+    reports: List[tuple[str, DailyBriefing]] = []
+    for account, mails in mails_by_account:
+        try:
+            report = analyze_emails_with_llm(mails)
+        except Exception as e:
+            print(f"❌ 分析 [{account}] 郵件時發生錯誤: {e}")
+            return 1
+        if report is None:
+            print(f"❌ LLM 未產出 [{account}] 的報告")
+            return 1
+        reports.append((account, report))
 
-    if report is None:
-        print("❌ LLM 未產出報告")
-        return 1
+    for account, report in reports:
+        print(f"\n📮 帳號: {account}")
+        print_report(report)
 
-    print_report(report)
     save_last_sync_time(run_started_at)
     print(f"\n✅ 處理完成，已更新同步時間點為: {run_started_at.strftime(TIME_FORMAT)}")
     return 0

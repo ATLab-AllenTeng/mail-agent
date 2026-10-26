@@ -141,6 +141,32 @@ class MainFlowTests(unittest.TestCase):
             self.assertEqual(run_agent.main([]), 1)
         self.assertFalse(self.cfg.exists())
 
+    def test_multiple_accounts_fetched_and_reported(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}]
+        report = run_agent.DailyBriefing(
+            total_processed=1,
+            briefings=[run_agent.EmailSummary(
+                subject="S", sender="F", date_str="D", summary="sum",
+                action_items=[], strategy_advice="advice")],
+        )
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails) as fetch, \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=report) as llm:
+            self.assertEqual(run_agent.main(["--account", "Celxpert, Keelgoal"]), 0)
+        self.assertEqual([c.args[0] for c in fetch.call_args_list], ["Celxpert", "Keelgoal"])
+        self.assertEqual(llm.call_count, 2)
+        self.assertTrue(self.cfg.exists())
+
+    def test_second_account_failure_keeps_timestamp(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}]
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails",
+                               side_effect=[mails, RuntimeError("no such account")]):
+            self.assertEqual(run_agent.main(["--account", "A,B"]), 1)
+        self.assertFalse(self.cfg.exists())
+
+    def test_split_accounts(self):
+        self.assertEqual(run_agent.split_accounts(" A , B,,A "), ["A", "B"])
+        self.assertEqual(run_agent.split_accounts(""), [])
+
     def test_all_flag_ignores_last_sync(self):
         run_agent.save_last_sync_time(datetime(2026, 1, 1, 0, 0, 0))
         with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=[]) as fetch:
