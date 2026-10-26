@@ -19,6 +19,7 @@ mail-agent/
 ├── run_agent.py          # 主程式：AppleScript 讀信 + LLM 分析
 ├── check_mail.command    # 一鍵啟動檔：雙擊即可在 Terminal 執行
 ├── requirements.txt      # Python 依賴套件
+├── .env.example          # 設定範本：複製為 .env 後填入 (已加入 .gitignore)
 ├── last_sync.json        # 自動生成：上次執行的時間戳記 (已加入 .gitignore)
 └── tests/                # 解析邏輯的單元測試
 ```
@@ -29,40 +30,46 @@ mail-agent/
 cd ~/src/mail-agent
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+cp .env.example .env && chmod 600 .env
 ```
 
-在 `~/.zshrc` 加入 API Key 與要處理的帳號：
-
-```bash
-export OPENAI_API_KEY="your-actual-api-key"
-export MAIL_AGENT_ACCOUNT="Celxpert,Keelgoal"
-```
+然後編輯 `.env` 填入帳號名稱、LLM 端點與金鑰。
 
 ## 設定
 
-| 環境變數 | 預設值 | 說明 |
+設定一律放在專案目錄的 `.env`，由 `run_agent.py` 自行載入，不需要也不建議寫進 `~/.zshrc`：
+所有變數都用 `MAIL_AGENT_` 前綴，程式也會把金鑰與端點明確傳給 SDK，
+所以 `~/.zshrc` 裡給其他應用用的 `OPENAI_*` 不會干擾這個專案，反之亦然。
+已存在的環境變數優先於 `.env`，臨時覆蓋可用 `MAIL_AGENT_MODEL=xxx .venv/bin/python run_agent.py`。
+
+| 變數 | 預設值 | 說明 |
 |---|---|---|
 | `MAIL_AGENT_ACCOUNT` | `Exchange` | 郵件 App 側邊欄顯示的公司帳號名稱，多個以逗號分隔，如 `Celxpert,Keelgoal` |
 | `MAIL_AGENT_MAILBOX` | `INBOX` | 收件夾名稱。找不到時會自動嘗試 `Inbox`、`收件匣` 等常見名稱，仍找不到請用 `--list-mailboxes` 查看實際名稱後指定 |
-| `OPENAI_MODEL` | `gpt-4o` | 使用的模型，可改 `gpt-4o-mini` |
-| `OPENAI_BASE_URL` | (無) | 指向自架 llm-router、Azure OpenAI 或其他 OpenAI 相容介面 |
-| `MAIL_AGENT_JSON_MODE` | `auto` | 結構化輸出方式：`schema` 用 OpenAI Structured Outputs；`prompt` 在提示詞中要求純 JSON 再以 pydantic 驗證，相容任何相容介面；`auto` 有設 `OPENAI_BASE_URL` 時用 `prompt`，否則 `schema` |
+| `MAIL_AGENT_API_KEY` | (無，必填) | LLM 端點的金鑰：接 llm-router 填它的 `LLM_ROUTER_API_KEY`，接 OpenAI 填 OpenAI 金鑰 |
+| `MAIL_AGENT_BASE_URL` | (無) | 指向自架 llm-router、Azure OpenAI 或其他 OpenAI 相容介面；留空則用 OpenAI 官方端點 |
+| `MAIL_AGENT_MODEL` | `gpt-4o` | 模型名稱；接 llm-router 填虛擬模型名稱如 `Mail-Briefing` |
+| `MAIL_AGENT_JSON_MODE` | `auto` | 結構化輸出方式：`schema` 用 OpenAI Structured Outputs；`prompt` 在提示詞中要求純 JSON 再以 pydantic 驗證，相容任何相容介面；`auto` 有設 `MAIL_AGENT_BASE_URL` 時用 `prompt`，否則 `schema` |
 | `MAIL_AGENT_MAX_BODY_CHARS` | `4000` | 每封信送出的內文字元上限 |
 | `MAIL_AGENT_BATCH_SIZE` | `10` | 每次 LLM 呼叫最多處理幾封信 |
+
+未設定 `MAIL_AGENT_API_KEY` / `MAIL_AGENT_BASE_URL` / `MAIL_AGENT_MODEL` 時才會退回讀取
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`，純粹為了向下相容。
 
 ### 接到自架 llm-router
 
 llm-router 對外是 OpenAI 相容 API，但不會把 `response_format` 轉送給後端 provider，
-因此要走 `prompt` 模式 (`auto` 會自動選到)。在 `~/.zshrc` 設定：
+因此要走 `prompt` 模式 (`auto` 會自動選到)。`.env` 這樣填：
 
 ```bash
-export OPENAI_BASE_URL="http://127.0.0.1:9001/v1"
-export OPENAI_API_KEY="<llm-router 的 LLM_ROUTER_API_KEY>"
-export OPENAI_MODEL="<router 裡的虛擬模型名稱>"
+MAIL_AGENT_BASE_URL=http://127.0.0.1:9001/v1
+MAIL_AGENT_API_KEY=<llm-router 的 LLM_ROUTER_API_KEY>
+MAIL_AGENT_MODEL=Mail-Briefing
 ```
 
-虛擬模型名稱可用 `curl http://127.0.0.1:9001/v1/models` 查看。郵件內容屬公司資料，
-建議在 router 設定一條只含有企業資料條款 provider (Azure、Anthropic、本機 Ollama) 的專用 chain。
+`Mail-Briefing` 是 router 裡專為郵件摘要建立的 chain，只含有企業資料條款或本機的 provider
+(Apple Intelligence、Azure、Anthropic、本機 Ollama)。虛擬模型清單可用
+`curl http://127.0.0.1:9001/v1/models` 查看。
 
 不確定帳號名稱時，先列出：
 

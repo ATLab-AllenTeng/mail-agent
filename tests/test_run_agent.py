@@ -226,14 +226,56 @@ class PromptModeTests(unittest.TestCase):
 
     def test_analyze_uses_prompt_mode_when_base_url_set(self):
         client = _fake_client([VALID_JSON])
-        env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://127.0.0.1:9001/v1"}
-        with mock.patch.dict(run_agent.os.environ, env), \
+        with mock.patch.object(run_agent, "LLM_API_KEY", "k"), \
+             mock.patch.object(run_agent, "LLM_BASE_URL", "http://127.0.0.1:9001/v1"), \
              mock.patch.object(run_agent, "JSON_MODE", "auto"), \
-             mock.patch("openai.OpenAI", return_value=client):
+             mock.patch("openai.OpenAI", return_value=client) as ctor:
             report = run_agent.analyze_emails_with_llm(self.batch)
         self.assertEqual(report.total_processed, 1)
+        ctor.assert_called_once_with(api_key="k", base_url="http://127.0.0.1:9001/v1")
         client.chat.completions.create.assert_called_once()
         client.chat.completions.parse.assert_not_called()
+
+    def test_analyze_requires_api_key(self):
+        with mock.patch.object(run_agent, "LLM_API_KEY", ""):
+            with self.assertRaises(ValueError):
+                run_agent.analyze_emails_with_llm(self.batch)
+
+
+class DotenvTests(unittest.TestCase):
+    def test_parses_file_without_overriding_existing(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".env"
+            path.write_text(
+                "# 註解\n"
+                "MAIL_AGENT_ACCOUNT=Celxpert,Keelgoal\n"
+                "export MAIL_AGENT_MODEL=\"Mail-Briefing\"\n"
+                "MAIL_AGENT_API_KEY='k=with=equals'\n"
+                "\n"
+                "BROKEN LINE\n"
+                "MAIL_AGENT_BATCH_SIZE=5\n",
+                encoding="utf-8",
+            )
+            env = {"MAIL_AGENT_BATCH_SIZE": "20"}
+            loaded = run_agent.load_dotenv(path, environ=env)
+        self.assertEqual(loaded, 3)
+        self.assertEqual(env["MAIL_AGENT_ACCOUNT"], "Celxpert,Keelgoal")
+        self.assertEqual(env["MAIL_AGENT_MODEL"], "Mail-Briefing")
+        self.assertEqual(env["MAIL_AGENT_API_KEY"], "k=with=equals")
+        self.assertEqual(env["MAIL_AGENT_BATCH_SIZE"], "20")
+
+    def test_missing_file(self):
+        self.assertEqual(run_agent.load_dotenv(Path("/nonexistent/.env"), environ={}), 0)
+
+    def test_setting_prefers_mail_agent_over_fallback(self):
+        env = {"OPENAI_MODEL": "gpt-4o-mini"}
+        with mock.patch.dict(run_agent.os.environ, env, clear=True):
+            self.assertEqual(run_agent.setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL"), "gpt-4o-mini")
+        env["MAIL_AGENT_MODEL"] = "Mail-Briefing"
+        with mock.patch.dict(run_agent.os.environ, env, clear=True):
+            self.assertEqual(run_agent.setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL"), "Mail-Briefing")
+        with mock.patch.dict(run_agent.os.environ, {}, clear=True):
+            self.assertEqual(run_agent.setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL"), "gpt-4o")
 
 
 class MainFlowTests(unittest.TestCase):

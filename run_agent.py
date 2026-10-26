@@ -31,22 +31,66 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "last_sync.json"
+ENV_FILE = BASE_DIR / ".env"
 
-# 郵件 App 側邊欄顯示的公司帳號名稱；多個帳號以逗號分隔，可用環境變數 MAIL_AGENT_ACCOUNT 覆寫
-TARGET_ACCOUNT = os.environ.get("MAIL_AGENT_ACCOUNT", "Exchange")
+
+def load_dotenv(path: Path = ENV_FILE, environ: Optional[dict] = None) -> int:
+    """極簡 .env 載入 (避免多一個相依套件)。
+
+    格式：KEY=VALUE，支援 # 註解、空行、export 前綴與成對引號。
+    已存在的環境變數不覆寫，所以臨時用 `MAIL_AGENT_MODEL=x python3 run_agent.py` 仍可覆蓋 .env。
+    回傳實際載入的變數數量。
+    """
+    env = os.environ if environ is None else environ
+    if not path.exists():
+        return 0
+    loaded = 0
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in env:
+            env[key] = value
+            loaded += 1
+    return loaded
+
+
+load_dotenv()
+
+
+def setting(name: str, default: str = "", fallback: Optional[str] = None) -> str:
+    """讀取 MAIL_AGENT_* 設定；未設定時可退回通用名稱 (如 OPENAI_*)，再退回預設值。"""
+    value = os.environ.get(name, "")
+    if not value and fallback:
+        value = os.environ.get(fallback, "")
+    return value if value else default
+
+
+# 郵件 App 側邊欄顯示的公司帳號名稱；多個帳號以逗號分隔
+TARGET_ACCOUNT = setting("MAIL_AGENT_ACCOUNT", "Exchange")
 # 收件夾名稱會因帳號類型與語系不同 (INBOX / Inbox / 收件匣)，程式會依序嘗試；
 # 可用 MAIL_AGENT_MAILBOX 指定優先名稱，用 --list-mailboxes 查看實際名稱
-TARGET_MAILBOX = os.environ.get("MAIL_AGENT_MAILBOX", "INBOX")
+TARGET_MAILBOX = setting("MAIL_AGENT_MAILBOX", "INBOX")
 INBOX_CANDIDATES = ["INBOX", "Inbox", "收件匣", "收件夹", "受信"]
 
-# LLM 設定；OPENAI_BASE_URL 可指向 Azure OpenAI、自架 llm-router 或其他相容介面
-LLM_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+# LLM 設定：一律以 MAIL_AGENT_* 為準，刻意不直接讀全域的 OPENAI_*，避免與其他應用互相干擾；
+# 只有在 MAIL_AGENT_* 完全未設定時才退回 OPENAI_* (向下相容)。
+# MAIL_AGENT_BASE_URL 可指向自架 llm-router、Azure OpenAI 或其他 OpenAI 相容介面。
+LLM_API_KEY = setting("MAIL_AGENT_API_KEY", fallback="OPENAI_API_KEY")
+LLM_BASE_URL = setting("MAIL_AGENT_BASE_URL", fallback="OPENAI_BASE_URL")
+LLM_MODEL = setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL")
 
 # 結構化輸出方式：
 #   schema  使用 OpenAI Structured Outputs (response_format=json_schema)，只有 OpenAI 官方端點保證支援
 #   prompt  在提示詞中要求模型輸出符合 JSON Schema 的純 JSON，再用 pydantic 驗證；相容任何 OpenAI 相容介面
-#   auto    有設定 OPENAI_BASE_URL 時用 prompt，否則用 schema
-JSON_MODE = os.environ.get("MAIL_AGENT_JSON_MODE", "auto").lower()
+#   auto    有設定 MAIL_AGENT_BASE_URL 時用 prompt，否則用 schema
+JSON_MODE = setting("MAIL_AGENT_JSON_MODE", "auto").lower()
 
 # 每封信內文最多送出的字元數、每次 LLM 呼叫最多幾封信
 MAX_BODY_CHARS = int(os.environ.get("MAIL_AGENT_MAX_BODY_CHARS", "4000"))
@@ -299,7 +343,7 @@ def resolve_json_mode(mode: str = JSON_MODE, base_url: Optional[str] = None) -> 
     if mode != "auto":
         raise ValueError(f"MAIL_AGENT_JSON_MODE 只能是 auto / schema / prompt，收到: {mode}")
     if base_url is None:
-        base_url = os.environ.get("OPENAI_BASE_URL", "")
+        base_url = LLM_BASE_URL
     return "prompt" if base_url.strip() else "schema"
 
 
@@ -372,13 +416,13 @@ def analyze_emails_with_llm(emails: List[dict]) -> Optional[DailyBriefing]:
     if not emails:
         return None
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("請設定 OPENAI_API_KEY 環境變數！")
+    if not LLM_API_KEY:
+        raise ValueError("請在專案的 .env 設定 MAIL_AGENT_API_KEY (可從 .env.example 複製)！")
 
     from openai import OpenAI  # 延遲載入，讓 --list-accounts / --dry-run 不需安裝 openai
 
-    client = OpenAI()  # 自動讀取 OPENAI_API_KEY / OPENAI_BASE_URL
+    # 明確傳入，不讓 SDK 自己去讀全域 OPENAI_* 環境變數
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
     mode = resolve_json_mode()
     call = _call_schema_mode if mode == "schema" else _call_prompt_mode
 
@@ -522,7 +566,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         print(f"🔍 共掃描到 {total} 封未標記旗標的信件")
     else:
-        endpoint = os.environ.get("OPENAI_BASE_URL", "").strip() or "OpenAI 官方端點"
+        endpoint = LLM_BASE_URL.strip() or "OpenAI 官方端點"
         print(f"🔍 共掃描到 {total} 封未標記旗標的信件，正在進行 AI 幕僚分析...")
         print(f"   🤖 模型: {LLM_MODEL} @ {endpoint} (輸出方式: {resolve_json_mode()})")
 
