@@ -93,7 +93,7 @@ class AppleScriptBuildTests(unittest.TestCase):
     def test_fetch_passes_script_and_parses(self):
         captured = {}
 
-        def fake_run(script):
+        def fake_run(script, on_progress=None):
             captured["script"] = script
             return f"S{FS}F{FS}D{FS}B{RS}"
 
@@ -104,6 +104,59 @@ class AppleScriptBuildTests(unittest.TestCase):
         self.assertIn('set inboxNames to {"INBOX", "Inbox", "收件匣", "收件夹", "受信"}', captured["script"])
         self.assertIn("is in inboxNames", captured["script"])
         self.assertIn("flagged status is false and date received > cutoffDate", captured["script"])
+        self.assertIn("set mailContent to content of m", captured["script"])
+        self.assertIn("set limitCount to 0", captured["script"])
+
+    def test_fetch_without_body_and_with_limit(self):
+        captured = {}
+
+        def fake_run(script, on_progress=None):
+            captured["script"] = script
+            if on_progress:
+                on_progress("已讀取 1/1 封")
+            return f"S{FS}F{FS}D{FS}{RS}"
+
+        progress = []
+        with mock.patch.object(run_agent, "run_applescript", fake_run):
+            mails = run_agent.fetch_unflagged_inbox_mails(
+                "X", include_body=False, limit=5, on_progress=progress.append)
+        self.assertEqual(mails[0]["body"], "")
+        self.assertIn('set mailContent to ""', captured["script"])
+        self.assertNotIn("content of m", captured["script"])
+        self.assertIn("set limitCount to 5", captured["script"])
+        self.assertEqual(progress, ["已讀取 1/1 封"])
+
+
+class RunAppleScriptTests(unittest.TestCase):
+    """用 python 子行程模擬 osascript，驗證進度行與錯誤處理。"""
+
+    def _fake_osascript(self, stderr_lines, stdout_text, exit_code):
+        code = (
+            "import sys\n"
+            + "".join(f"sys.stderr.write({line!r} + '\\n'); sys.stderr.flush()\n" for line in stderr_lines)
+            + f"sys.stdout.write({stdout_text!r})\n"
+            + f"sys.exit({exit_code})\n"
+        )
+        real_popen = run_agent.subprocess.Popen
+
+        def popen(args, **kw):
+            return real_popen([sys.executable, "-c", code], **kw)
+
+        return mock.patch.object(run_agent.subprocess, "Popen", popen)
+
+    def test_progress_lines_are_reported_and_stdout_returned(self):
+        progress = []
+        with self._fake_osascript(
+            [run_agent.PROGRESS_PREFIX + "a", run_agent.PROGRESS_PREFIX + "b"], "OUT", 0):
+            out = run_agent.run_applescript("ignored", on_progress=progress.append)
+        self.assertEqual(out, "OUT")
+        self.assertEqual(progress, ["a", "b"])
+
+    def test_error_excludes_progress_lines(self):
+        with self._fake_osascript([run_agent.PROGRESS_PREFIX + "a", "boom happened"], "", 1):
+            with self.assertRaises(RuntimeError) as ctx:
+                run_agent.run_applescript("ignored")
+        self.assertEqual(str(ctx.exception), "boom happened")
 
 
 class MainFlowTests(unittest.TestCase):
@@ -122,13 +175,21 @@ class MainFlowTests(unittest.TestCase):
             self.assertEqual(run_agent.main([]), 0)
         self.assertFalse(self.cfg.exists())
 
-    def test_dry_run_skips_llm_and_timestamp(self):
-        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}]
-        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails), \
+    def test_dry_run_skips_llm_timestamp_and_body(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": ""}]
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails) as fetch, \
              mock.patch.object(run_agent, "analyze_emails_with_llm") as llm:
-            self.assertEqual(run_agent.main(["--dry-run"]), 0)
+            self.assertEqual(run_agent.main(["--dry-run", "--limit", "3"]), 0)
         llm.assert_not_called()
         self.assertFalse(self.cfg.exists())
+        self.assertFalse(fetch.call_args.kwargs["include_body"])
+        self.assertEqual(fetch.call_args.kwargs["limit"], 3)
+
+    def test_normal_run_fetches_body(self):
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=[]) as fetch:
+            run_agent.main([])
+        self.assertTrue(fetch.call_args.kwargs["include_body"])
+        self.assertIsNone(fetch.call_args.kwargs["limit"])
 
     def test_success_updates_timestamp(self):
         mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}]

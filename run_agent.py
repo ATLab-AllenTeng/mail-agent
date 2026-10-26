@@ -19,9 +19,10 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -94,13 +95,46 @@ def save_last_sync_time(sync_time: datetime) -> None:
 # ---------------------------------------------------------------------------
 # AppleScript 郵件擷取
 # ---------------------------------------------------------------------------
-def run_applescript(script: str) -> str:
-    result = subprocess.run(
-        ["osascript", "-e", script], capture_output=True, text=True, encoding="utf-8"
+PROGRESS_PREFIX = "MAILAGENT_PROGRESS "
+
+
+def run_applescript(script: str, on_progress: Optional[Callable[[str], None]] = None) -> str:
+    """執行 AppleScript 並回傳 stdout。
+
+    腳本中的 `log "MAILAGENT_PROGRESS ..."` 會在執行期間即時寫到 stderr，
+    這裡逐行讀取並透過 on_progress 回報；其餘 stderr 內容視為錯誤訊息。
+    """
+    proc = subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
     )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "osascript 執行失敗")
-    return result.stdout
+    assert proc.stdout is not None and proc.stderr is not None
+
+    stdout_chunks: List[str] = []
+
+    def drain_stdout() -> None:
+        stdout_chunks.append(proc.stdout.read())
+
+    reader = threading.Thread(target=drain_stdout, daemon=True)
+    reader.start()
+
+    error_lines: List[str] = []
+    for line in proc.stderr:
+        line = line.rstrip("\n")
+        if line.startswith(PROGRESS_PREFIX):
+            if on_progress:
+                on_progress(line[len(PROGRESS_PREFIX):])
+        elif line.strip():
+            error_lines.append(line)
+
+    reader.join()
+    returncode = proc.wait()
+    if returncode != 0:
+        raise RuntimeError("\n".join(error_lines).strip() or "osascript 執行失敗")
+    return "".join(stdout_chunks)
 
 
 def list_accounts() -> List[str]:
@@ -148,15 +182,27 @@ def inbox_candidates(mailbox: str = TARGET_MAILBOX) -> List[str]:
 
 
 def fetch_unflagged_inbox_mails(
-    account_name: str, since: Optional[datetime] = None, mailbox: str = TARGET_MAILBOX
+    account_name: str,
+    since: Optional[datetime] = None,
+    mailbox: str = TARGET_MAILBOX,
+    include_body: bool = True,
+    limit: Optional[int] = None,
+    on_progress: Optional[Callable[[str], None]] = None,
 ) -> List[dict]:
-    """讀取指定帳號收件夾中「無旗標」且 (若提供) 「晚於 since」的信件。"""
+    """讀取指定帳號收件夾中「無旗標」且 (若提供) 「晚於 since」的信件。
+
+    include_body=False 時不讀取內文 (快很多，供 dry-run 使用)；
+    limit 限制最多讀取幾封，依郵件 App 回傳的順序取前 N 封 (通常最新的在前)。
+    """
     acct = _applescript_string(account_name)
     candidates = _applescript_list(inbox_candidates(mailbox))
+    limit_value = int(limit) if limit and limit > 0 else 0
+    body_expr = "content of m" if include_body else '""'
     script = f"""
     set RS to string id 30
     set FS to string id 31
     set inboxNames to {candidates}
+    set limitCount to {limit_value}
     {_applescript_cutoff(since)}
     tell application "Mail"
         set targetAccount to account "{acct}"
@@ -172,26 +218,40 @@ def fetch_unflagged_inbox_mails(
             set AppleScript's text item delimiters to ", "
             error "帳號「{acct}」找不到收件夾，實際的信箱名稱有: " & (availableNames as string) & "。請用 MAIL_AGENT_MAILBOX 指定。"
         end if
+        log "{PROGRESS_PREFIX}正在篩選 [" & (name of targetMailbox) & "] 中的信件..."
         if cutoffDate is missing value then
             set targetMessages to (every message of targetMailbox whose flagged status is false)
         else
             set targetMessages to (every message of targetMailbox whose flagged status is false and date received > cutoffDate)
         end if
+        set totalCount to count of targetMessages
+        if limitCount > 0 and totalCount > limitCount then
+            log "{PROGRESS_PREFIX}符合條件 " & totalCount & " 封，依 --limit 只讀取前 " & limitCount & " 封"
+            set totalCount to limitCount
+        else
+            log "{PROGRESS_PREFIX}符合條件 " & totalCount & " 封，開始讀取..."
+        end if
         set output to ""
+        set i to 0
         repeat with m in targetMessages
+            if i ≥ totalCount then exit repeat
+            set i to i + 1
             set mailSubject to subject of m
             set mailSender to sender of m
             set mailDate to (date received of m) as string
             set mailContent to ""
             try
-                set mailContent to content of m
+                set mailContent to {body_expr}
             end try
             set output to output & mailSubject & FS & mailSender & FS & mailDate & FS & mailContent & RS
+            if i mod 10 = 0 or i = totalCount then
+                log "{PROGRESS_PREFIX}已讀取 " & i & "/" & totalCount & " 封"
+            end if
         end repeat
         return output
     end tell
     """
-    return parse_mail_output(run_applescript(script))
+    return parse_mail_output(run_applescript(script, on_progress=on_progress))
 
 
 def parse_mail_output(raw: str) -> List[dict]:
@@ -290,8 +350,9 @@ def print_raw_mails(mails: List[dict]) -> None:
         print(f"\n【{idx}】{m['subject']}")
         print(f" 👤 寄件人: {m['sender']}")
         print(f" 🕒 時間: {m['date_str']}")
-        preview = m["body"].replace("\n", " ")[:120]
-        print(f" 📄 內文預覽: {preview}")
+        if m["body"]:
+            preview = m["body"].replace("\n", " ")[:120]
+            print(f" 📄 內文預覽: {preview}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +374,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--list-mailboxes", action="store_true", help="列出 --account 指定帳號底下的信箱名稱後結束")
     parser.add_argument("--dry-run", action="store_true", help="只抓取信件並列出，不呼叫 LLM、不更新時間戳")
     parser.add_argument("--all", action="store_true", help="忽略上次執行時間，掃描所有無旗標信件")
+    parser.add_argument("--limit", type=int, default=None, metavar="N", help="每個帳號最多讀取 N 封信 (依郵件 App 順序取前 N 封)")
     parser.add_argument(
         "--account",
         default=TARGET_ACCOUNT,
@@ -370,7 +432,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     for account in accounts:
         print(f"📥 正在讀取 [{account}] 帳號的收件夾 ({TARGET_MAILBOX})...")
         try:
-            mails = fetch_unflagged_inbox_mails(account, since=last_sync)
+            mails = fetch_unflagged_inbox_mails(
+                account,
+                since=last_sync,
+                include_body=not args.dry_run,
+                limit=args.limit,
+                on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True),
+            )
         except RuntimeError as e:
             print(f"❌ 讀取 [{account}] 郵件失敗: {e}")
             print("   提示: 請確認已允許 Terminal 控制「郵件」，並用 --list-accounts / --list-mailboxes 確認名稱。")
@@ -390,7 +458,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         for account, mails in mails_by_account:
             print(f"\n📮 帳號: {account} ({len(mails)} 封)")
             print_raw_mails(mails)
-        print("\n(dry-run 模式：未呼叫 LLM，也未更新同步時間點)")
+        print("\n(dry-run 模式：未讀取內文、未呼叫 LLM，也未更新同步時間點)")
         return 0
 
     reports: List[tuple[str, DailyBriefing]] = []
