@@ -39,8 +39,14 @@ TARGET_ACCOUNT = os.environ.get("MAIL_AGENT_ACCOUNT", "Exchange")
 TARGET_MAILBOX = os.environ.get("MAIL_AGENT_MAILBOX", "INBOX")
 INBOX_CANDIDATES = ["INBOX", "Inbox", "收件匣", "收件夹", "受信"]
 
-# LLM 設定；OPENAI_BASE_URL 可指向 Azure OpenAI 或其他相容介面
+# LLM 設定；OPENAI_BASE_URL 可指向 Azure OpenAI、自架 llm-router 或其他相容介面
 LLM_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+
+# 結構化輸出方式：
+#   schema  使用 OpenAI Structured Outputs (response_format=json_schema)，只有 OpenAI 官方端點保證支援
+#   prompt  在提示詞中要求模型輸出符合 JSON Schema 的純 JSON，再用 pydantic 驗證；相容任何 OpenAI 相容介面
+#   auto    有設定 OPENAI_BASE_URL 時用 prompt，否則用 schema
+JSON_MODE = os.environ.get("MAIL_AGENT_JSON_MODE", "auto").lower()
 
 # 每封信內文最多送出的字元數、每次 LLM 呼叫最多幾封信
 MAX_BODY_CHARS = int(os.environ.get("MAIL_AGENT_MAX_BODY_CHARS", "4000"))
@@ -286,6 +292,82 @@ SYSTEM_PROMPT = (
 )
 
 
+def resolve_json_mode(mode: str = JSON_MODE, base_url: Optional[str] = None) -> str:
+    """決定實際使用的結構化輸出方式 ('schema' 或 'prompt')。"""
+    if mode in ("schema", "prompt"):
+        return mode
+    if mode != "auto":
+        raise ValueError(f"MAIL_AGENT_JSON_MODE 只能是 auto / schema / prompt，收到: {mode}")
+    if base_url is None:
+        base_url = os.environ.get("OPENAI_BASE_URL", "")
+    return "prompt" if base_url.strip() else "schema"
+
+
+def extract_json(text: str) -> str:
+    """從模型回覆中取出 JSON 物件：去掉 markdown 圍欄與前後多餘文字。"""
+    text = text.strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        text = text[first_newline + 1 :] if first_newline != -1 else text[3:]
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("回覆中找不到 JSON 物件")
+    return text[start : end + 1]
+
+
+def _build_user_prompt(batch: List[dict]) -> str:
+    return (
+        "請閱讀以下來自公司收件匣的最新郵件，為使用者進行重點摘要、"
+        "萃取行動事項，並提供具體切實的應對方針建議。\n\n"
+        f"郵件資料 (共 {len(batch)} 封):\n"
+        f"{json.dumps(batch, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _call_schema_mode(client, batch: List[dict]) -> DailyBriefing:
+    completion = client.chat.completions.parse(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": _build_user_prompt(batch)},
+        ],
+        response_format=DailyBriefing,
+    )
+    parsed = completion.choices[0].message.parsed
+    if parsed is None:
+        raise RuntimeError("LLM 未回傳有效的結構化結果")
+    return parsed
+
+
+def _call_prompt_mode(client, batch: List[dict], max_attempts: int = 2) -> DailyBriefing:
+    schema = json.dumps(DailyBriefing.model_json_schema(), ensure_ascii=False)
+    system = (
+        SYSTEM_PROMPT
+        + "\n\n輸出規則：只輸出一個符合以下 JSON Schema 的 JSON 物件，"
+        "不要加 markdown 圍欄、不要加任何說明文字。\n"
+        f"JSON Schema:\n{schema}"
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _build_user_prompt(batch)},
+    ]
+    last_error: Optional[Exception] = None
+    for _ in range(max_attempts):
+        completion = client.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0)
+        content = completion.choices[0].message.content or ""
+        try:
+            return DailyBriefing.model_validate_json(extract_json(content))
+        except Exception as e:  # JSON 壞掉或欄位不符：把錯誤回饋給模型再試一次
+            last_error = e
+            messages = messages + [
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": f"你的輸出無法解析：{e}\n請只輸出修正後、完整且合法的 JSON 物件。"},
+            ]
+    raise RuntimeError(f"LLM 回覆無法解析為結構化結果: {last_error}")
+
+
 def analyze_emails_with_llm(emails: List[dict]) -> Optional[DailyBriefing]:
     if not emails:
         return None
@@ -297,28 +379,13 @@ def analyze_emails_with_llm(emails: List[dict]) -> Optional[DailyBriefing]:
     from openai import OpenAI  # 延遲載入，讓 --list-accounts / --dry-run 不需安裝 openai
 
     client = OpenAI()  # 自動讀取 OPENAI_API_KEY / OPENAI_BASE_URL
+    mode = resolve_json_mode()
+    call = _call_schema_mode if mode == "schema" else _call_prompt_mode
 
     all_briefings: List[EmailSummary] = []
     for start in range(0, len(emails), BATCH_SIZE):
         batch = emails[start : start + BATCH_SIZE]
-        prompt = (
-            "請閱讀以下來自公司收件匣的最新郵件，為使用者進行重點摘要、"
-            "萃取行動事項，並提供具體切實的應對方針建議。\n\n"
-            f"郵件資料 (共 {len(batch)} 封):\n"
-            f"{json.dumps(batch, ensure_ascii=False, indent=2)}"
-        )
-        completion = client.chat.completions.parse(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format=DailyBriefing,
-        )
-        parsed = completion.choices[0].message.parsed
-        if parsed is None:
-            raise RuntimeError("LLM 未回傳有效的結構化結果")
-        all_briefings.extend(parsed.briefings)
+        all_briefings.extend(call(client, batch).briefings)
 
     return DailyBriefing(total_processed=len(all_briefings), briefings=all_briefings)
 
@@ -452,7 +519,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("✨ 目前收件夾沒有需要處理的新信件！")
         return 0
 
-    print(f"🔍 共掃描到 {total} 封未標記旗標的信件" + ("" if args.dry_run else "，正在進行 AI 幕僚分析..."))
+    if args.dry_run:
+        print(f"🔍 共掃描到 {total} 封未標記旗標的信件")
+    else:
+        endpoint = os.environ.get("OPENAI_BASE_URL", "").strip() or "OpenAI 官方端點"
+        print(f"🔍 共掃描到 {total} 封未標記旗標的信件，正在進行 AI 幕僚分析...")
+        print(f"   🤖 模型: {LLM_MODEL} @ {endpoint} (輸出方式: {resolve_json_mode()})")
 
     if args.dry_run:
         for account, mails in mails_by_account:

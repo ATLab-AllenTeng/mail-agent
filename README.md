@@ -45,9 +45,24 @@ export MAIL_AGENT_ACCOUNT="Celxpert,Keelgoal"
 | `MAIL_AGENT_ACCOUNT` | `Exchange` | 郵件 App 側邊欄顯示的公司帳號名稱，多個以逗號分隔，如 `Celxpert,Keelgoal` |
 | `MAIL_AGENT_MAILBOX` | `INBOX` | 收件夾名稱。找不到時會自動嘗試 `Inbox`、`收件匣` 等常見名稱，仍找不到請用 `--list-mailboxes` 查看實際名稱後指定 |
 | `OPENAI_MODEL` | `gpt-4o` | 使用的模型，可改 `gpt-4o-mini` |
-| `OPENAI_BASE_URL` | (無) | 指向 Azure OpenAI 或其他相容介面 |
+| `OPENAI_BASE_URL` | (無) | 指向自架 llm-router、Azure OpenAI 或其他 OpenAI 相容介面 |
+| `MAIL_AGENT_JSON_MODE` | `auto` | 結構化輸出方式：`schema` 用 OpenAI Structured Outputs；`prompt` 在提示詞中要求純 JSON 再以 pydantic 驗證，相容任何相容介面；`auto` 有設 `OPENAI_BASE_URL` 時用 `prompt`，否則 `schema` |
 | `MAIL_AGENT_MAX_BODY_CHARS` | `4000` | 每封信送出的內文字元上限 |
 | `MAIL_AGENT_BATCH_SIZE` | `10` | 每次 LLM 呼叫最多處理幾封信 |
+
+### 接到自架 llm-router
+
+llm-router 對外是 OpenAI 相容 API，但不會把 `response_format` 轉送給後端 provider，
+因此要走 `prompt` 模式 (`auto` 會自動選到)。在 `~/.zshrc` 設定：
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:9001/v1"
+export OPENAI_API_KEY="<llm-router 的 LLM_ROUTER_API_KEY>"
+export OPENAI_MODEL="<router 裡的虛擬模型名稱>"
+```
+
+虛擬模型名稱可用 `curl http://127.0.0.1:9001/v1/models` 查看。郵件內容屬公司資料，
+建議在 router 設定一條只含有企業資料條款 provider (Azure、Anthropic、本機 Ollama) 的專用 chain。
 
 不確定帳號名稱時，先列出：
 

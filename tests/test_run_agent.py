@@ -159,6 +159,83 @@ class RunAppleScriptTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "boom happened")
 
 
+class JsonModeTests(unittest.TestCase):
+    def test_resolve_explicit_modes(self):
+        self.assertEqual(run_agent.resolve_json_mode("schema", base_url="http://x"), "schema")
+        self.assertEqual(run_agent.resolve_json_mode("prompt", base_url=""), "prompt")
+
+    def test_resolve_auto_by_base_url(self):
+        self.assertEqual(run_agent.resolve_json_mode("auto", base_url=""), "schema")
+        self.assertEqual(run_agent.resolve_json_mode("auto", base_url="http://127.0.0.1:9001/v1"), "prompt")
+
+    def test_resolve_invalid_mode(self):
+        with self.assertRaises(ValueError):
+            run_agent.resolve_json_mode("weird", base_url="")
+
+    def test_extract_json_strips_fences_and_prose(self):
+        self.assertEqual(run_agent.extract_json('```json\n{"a": 1}\n```'), '{"a": 1}')
+        self.assertEqual(run_agent.extract_json('好的，結果如下：{"a": {"b": 2}} 以上。'), '{"a": {"b": 2}}')
+        with self.assertRaises(ValueError):
+            run_agent.extract_json("沒有 json")
+
+
+def _fake_client(contents):
+    """模擬 OpenAI client：chat.completions.create 依序回傳 contents 中的文字。"""
+    client = mock.MagicMock()
+    responses = []
+    for c in contents:
+        r = mock.MagicMock()
+        r.choices = [mock.MagicMock()]
+        r.choices[0].message.content = c
+        responses.append(r)
+    client.chat.completions.create.side_effect = responses
+    return client
+
+
+VALID_JSON = (
+    '{"total_processed": 1, "briefings": [{"subject": "S", "sender": "F", "date_str": "D", '
+    '"summary": "sum", "action_items": ["do"], "strategy_advice": "adv"}]}'
+)
+
+
+class PromptModeTests(unittest.TestCase):
+    batch = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}]
+
+    def test_parses_fenced_json(self):
+        client = _fake_client(["```json\n" + VALID_JSON + "\n```"])
+        report = run_agent._call_prompt_mode(client, self.batch)
+        self.assertEqual(report.briefings[0].summary, "sum")
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+        kwargs = client.chat.completions.create.call_args.kwargs
+        self.assertIn("JSON Schema", kwargs["messages"][0]["content"])
+        self.assertNotIn("response_format", kwargs)
+
+    def test_retries_once_with_feedback(self):
+        client = _fake_client(["不是 json", VALID_JSON])
+        report = run_agent._call_prompt_mode(client, self.batch)
+        self.assertEqual(report.total_processed, 1)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        second_messages = client.chat.completions.create.call_args.kwargs["messages"]
+        self.assertEqual(second_messages[-2]["role"], "assistant")
+        self.assertIn("無法解析", second_messages[-1]["content"])
+
+    def test_gives_up_after_retries(self):
+        client = _fake_client(["x", "y"])
+        with self.assertRaises(RuntimeError):
+            run_agent._call_prompt_mode(client, self.batch)
+
+    def test_analyze_uses_prompt_mode_when_base_url_set(self):
+        client = _fake_client([VALID_JSON])
+        env = {"OPENAI_API_KEY": "k", "OPENAI_BASE_URL": "http://127.0.0.1:9001/v1"}
+        with mock.patch.dict(run_agent.os.environ, env), \
+             mock.patch.object(run_agent, "JSON_MODE", "auto"), \
+             mock.patch("openai.OpenAI", return_value=client):
+            report = run_agent.analyze_emails_with_llm(self.batch)
+        self.assertEqual(report.total_processed, 1)
+        client.chat.completions.create.assert_called_once()
+        client.chat.completions.parse.assert_not_called()
+
+
 class MainFlowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
