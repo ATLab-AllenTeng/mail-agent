@@ -43,7 +43,7 @@ export MAIL_AGENT_ACCOUNT="Celxpert,Keelgoal"
 | 環境變數 | 預設值 | 說明 |
 |---|---|---|
 | `MAIL_AGENT_ACCOUNT` | `Exchange` | 郵件 App 側邊欄顯示的公司帳號名稱，多個以逗號分隔，如 `Celxpert,Keelgoal` |
-| `MAIL_AGENT_MAILBOX` | `INBOX` | 要讀取的信箱資料夾 |
+| `MAIL_AGENT_MAILBOX` | `INBOX` | 收件夾名稱。找不到時會自動嘗試 `Inbox`、`收件匣` 等常見名稱，仍找不到請用 `--list-mailboxes` 查看實際名稱後指定 |
 | `OPENAI_MODEL` | `gpt-4o` | 使用的模型，可改 `gpt-4o-mini` |
 | `OPENAI_BASE_URL` | (無) | 指向 Azure OpenAI 或其他相容介面 |
 | `MAIL_AGENT_MAX_BODY_CHARS` | `4000` | 每封信送出的內文字元上限 |
@@ -71,6 +71,7 @@ export MAIL_AGENT_ACCOUNT="Celxpert,Keelgoal"
 | `--all` | 忽略上次執行時間，掃描所有無旗標信件 |
 | `--account NAME` | 臨時指定帳號名稱，多個以逗號分隔 |
 | `--list-accounts` | 列出郵件 App 中的帳號 |
+| `--list-mailboxes` | 列出 `--account` 指定帳號底下的信箱名稱 (排查找不到收件夾時使用) |
 
 ## 注意事項
 
@@ -78,8 +79,10 @@ export MAIL_AGENT_ACCOUNT="Celxpert,Keelgoal"
    若誤按拒絕，到「系統設定 > 隱私權與安全性 > 自動化」重新開啟。
 2. **帳號名稱**：`MAIL_AGENT_ACCOUNT` 必須與郵件 App 側邊欄顯示的名稱一致，可用 `--list-accounts` 確認。
    多個帳號請在同一次執行中以逗號指定，不要分次跑：`last_sync.json` 是所有帳號共用的，分次跑會讓後面的帳號漏信。
-3. **資料隱私**：只有「無旗標」且在「收件夾」中的信件文本會送至 LLM API，請確認符合公司 AI 工具使用規範。
-4. **時間戳**：同步時間點在**抓信前**記錄，因此執行期間抵達的信件不會被漏掉，下次執行仍會處理。
+3. **收件夾名稱**：Exchange 帳號的收件夾在郵件 App 中可能叫 `Inbox` 或「收件匣」而非 `INBOX`，程式會自動嘗試常見名稱；
+   若仍報「找不到收件夾」，錯誤訊息會列出該帳號實際的信箱名稱，將其設到 `MAIL_AGENT_MAILBOX` 即可。
+4. **資料隱私**：只有「無旗標」且在「收件夾」中的信件文本會送至 LLM API，請確認符合公司 AI 工具使用規範。
+5. **時間戳**：同步時間點在**抓信前**記錄，因此執行期間抵達的信件不會被漏掉，下次執行仍會處理。
 
 ## 測試
 

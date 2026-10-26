@@ -33,7 +33,10 @@ CONFIG_FILE = BASE_DIR / "last_sync.json"
 
 # 郵件 App 側邊欄顯示的公司帳號名稱；多個帳號以逗號分隔，可用環境變數 MAIL_AGENT_ACCOUNT 覆寫
 TARGET_ACCOUNT = os.environ.get("MAIL_AGENT_ACCOUNT", "Exchange")
+# 收件夾名稱會因帳號類型與語系不同 (INBOX / Inbox / 收件匣)，程式會依序嘗試；
+# 可用 MAIL_AGENT_MAILBOX 指定優先名稱，用 --list-mailboxes 查看實際名稱
 TARGET_MAILBOX = os.environ.get("MAIL_AGENT_MAILBOX", "INBOX")
+INBOX_CANDIDATES = ["INBOX", "Inbox", "收件匣", "收件夹", "受信"]
 
 # LLM 設定；OPENAI_BASE_URL 可指向 Azure OpenAI 或其他相容介面
 LLM_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
@@ -106,6 +109,13 @@ def list_accounts() -> List[str]:
     return [a.strip() for a in out.split(",") if a.strip()] if out else []
 
 
+def list_mailboxes(account_name: str) -> List[str]:
+    acct = _applescript_string(account_name)
+    script = f'tell application "Mail" to return name of every mailbox of account "{acct}"'
+    out = run_applescript(script).strip()
+    return [m.strip() for m in out.split(",") if m.strip()] if out else []
+
+
 def _applescript_string(value: str) -> str:
     """把 Python 字串安全地放進 AppleScript 的雙引號字串中。"""
     return value.replace("\\", "\\\\").replace('"', '\\"')
@@ -127,19 +137,41 @@ def _applescript_cutoff(since: Optional[datetime]) -> str:
     """
 
 
+def _applescript_list(values: List[str]) -> str:
+    return "{" + ", ".join(f'"{_applescript_string(v)}"' for v in values) + "}"
+
+
+def inbox_candidates(mailbox: str = TARGET_MAILBOX) -> List[str]:
+    """使用者指定的名稱優先，其後依序是常見的收件夾名稱。"""
+    names = [mailbox] + [c for c in INBOX_CANDIDATES if c != mailbox]
+    return names
+
+
 def fetch_unflagged_inbox_mails(
     account_name: str, since: Optional[datetime] = None, mailbox: str = TARGET_MAILBOX
 ) -> List[dict]:
-    """讀取指定帳號 INBOX 中「無旗標」且 (若提供) 「晚於 since」的信件。"""
+    """讀取指定帳號收件夾中「無旗標」且 (若提供) 「晚於 since」的信件。"""
     acct = _applescript_string(account_name)
-    mbox = _applescript_string(mailbox)
+    candidates = _applescript_list(inbox_candidates(mailbox))
     script = f"""
-    set RS to (ASCII character 30)
-    set FS to (ASCII character 31)
+    set RS to string id 30
+    set FS to string id 31
+    set inboxNames to {candidates}
     {_applescript_cutoff(since)}
     tell application "Mail"
         set targetAccount to account "{acct}"
-        set targetMailbox to mailbox "{mbox}" of targetAccount
+        set targetMailbox to missing value
+        repeat with mb in (every mailbox of targetAccount)
+            if (name of mb) is in inboxNames then
+                set targetMailbox to mb
+                exit repeat
+            end if
+        end repeat
+        if targetMailbox is missing value then
+            set availableNames to name of every mailbox of targetAccount
+            set AppleScript's text item delimiters to ", "
+            error "帳號「{acct}」找不到收件夾，實際的信箱名稱有: " & (availableNames as string) & "。請用 MAIL_AGENT_MAILBOX 指定。"
+        end if
         if cutoffDate is missing value then
             set targetMessages to (every message of targetMailbox whose flagged status is false)
         else
@@ -278,6 +310,7 @@ def split_accounts(value: str) -> List[str]:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="macOS Mail Agent — Exchange 郵件 AI 幕僚")
     parser.add_argument("--list-accounts", action="store_true", help="列出郵件 App 中的帳號名稱後結束")
+    parser.add_argument("--list-mailboxes", action="store_true", help="列出 --account 指定帳號底下的信箱名稱後結束")
     parser.add_argument("--dry-run", action="store_true", help="只抓取信件並列出，不呼叫 LLM、不更新時間戳")
     parser.add_argument("--all", action="store_true", help="忽略上次執行時間，掃描所有無旗標信件")
     parser.add_argument(
@@ -306,6 +339,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"   - {a}")
         return 0
 
+    if args.list_mailboxes:
+        for account in split_accounts(args.account):
+            try:
+                names = list_mailboxes(account)
+            except RuntimeError as e:
+                print(f"❌ 無法讀取 [{account}] 的信箱: {e}")
+                return 1
+            print(f"📮 [{account}] 的信箱:")
+            for n in names:
+                print(f"   - {n}")
+        return 0
+
     last_sync = None if args.all else get_last_sync_time()
     print(
         "📅 上次處理時間: "
@@ -328,7 +373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             mails = fetch_unflagged_inbox_mails(account, since=last_sync)
         except RuntimeError as e:
             print(f"❌ 讀取 [{account}] 郵件失敗: {e}")
-            print("   提示: 請確認已允許 Terminal 控制「郵件」，並用 --list-accounts 確認帳號名稱。")
+            print("   提示: 請確認已允許 Terminal 控制「郵件」，並用 --list-accounts / --list-mailboxes 確認名稱。")
             return 1
         print(f"   找到 {len(mails)} 封未標記旗標的新信件")
         if mails:

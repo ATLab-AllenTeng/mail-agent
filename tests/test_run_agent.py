@@ -75,6 +75,15 @@ class AppleScriptBuildTests(unittest.TestCase):
                      "minutes of cutoffDate to 30", "seconds of cutoffDate to 15"):
             self.assertIn(frag, s)
 
+    def test_inbox_candidates_prefers_configured_name(self):
+        self.assertEqual(run_agent.inbox_candidates("收件匣")[:2], ["收件匣", "INBOX"])
+        self.assertEqual(run_agent.inbox_candidates("INBOX")[0], "INBOX")
+        self.assertEqual(run_agent.inbox_candidates("INBOX").count("INBOX"), 1)
+
+    def test_list_mailboxes_parses_names(self):
+        with mock.patch.object(run_agent, "run_applescript", return_value="Inbox, Sent Items, Drafts\n"):
+            self.assertEqual(run_agent.list_mailboxes("Celxpert"), ["Inbox", "Sent Items", "Drafts"])
+
     def test_no_cutoff(self):
         self.assertIn("missing value", run_agent._applescript_cutoff(None))
 
@@ -92,7 +101,8 @@ class AppleScriptBuildTests(unittest.TestCase):
             mails = run_agent.fetch_unflagged_inbox_mails("My Exchange", since=datetime(2026, 1, 2, 3, 4, 5))
         self.assertEqual(mails, [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}])
         self.assertIn('account "My Exchange"', captured["script"])
-        self.assertIn('mailbox "INBOX"', captured["script"])
+        self.assertIn('set inboxNames to {"INBOX", "Inbox", "收件匣", "收件夹", "受信"}', captured["script"])
+        self.assertIn("is in inboxNames", captured["script"])
         self.assertIn("flagged status is false and date received > cutoffDate", captured["script"])
 
 
