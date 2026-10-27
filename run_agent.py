@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -95,6 +96,9 @@ JSON_MODE = setting("MAIL_AGENT_JSON_MODE", "auto").lower()
 # 每封信內文最多送出的字元數、每次 LLM 呼叫最多幾封信
 MAX_BODY_CHARS = int(os.environ.get("MAIL_AGENT_MAX_BODY_CHARS", "4000"))
 BATCH_SIZE = int(os.environ.get("MAIL_AGENT_BATCH_SIZE", "10"))
+
+# LLM 回覆解析失敗時，原始回覆存到這裡供診斷 (預設 ~/.mail-agent/debug)
+DEBUG_DIR = Path(os.environ.get("MAIL_AGENT_DEBUG_DIR", str(Path.home() / ".mail-agent" / "debug")))
 
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -356,9 +360,103 @@ def extract_json(text: str) -> str:
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3]
     start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         raise ValueError("回覆中找不到 JSON 物件")
+    if end < start:
+        end = len(text) - 1  # 沒有結尾的 }：輸出被截斷，交給 repair_json 補完
     return text[start : end + 1]
+
+
+def repair_json(text: str, max_fixes: int = 50) -> str:
+    """修復 LLM 常見的 JSON 錯誤，回傳能被 json.loads 接受的字串；修不好就拋出原始錯誤。
+
+    處理的情況：字串內的裸換行 / 控制字元、尾端多餘的逗號、多出來的 ] 或 }、
+    字串內未跳脫的引號、輸出被截斷而缺少的結尾括號。
+    """
+    candidate = text
+    # 字串內的裸換行、tab 等控制字元 → 跳脫
+    def _escape_controls(m: "re.Match[str]") -> str:
+        return m.group(0).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    candidate = re.sub(r'"(?:[^"\\]|\\.)*"', _escape_controls, candidate, flags=re.S)
+    # 尾端多餘的逗號：,] 或 ,}
+    candidate = re.sub(r",\s*([\]}])", r"\1", candidate)
+
+    last_error: Optional[json.JSONDecodeError] = None
+    for _ in range(max_fixes):
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError as e:
+            last_error = e
+            pos = e.pos
+            msg = e.msg
+            if msg.startswith("Extra data"):
+                # 物件已完整，後面是多出來的字元 (常見：多一個 ] 或 })
+                candidate = candidate[:pos].rstrip()
+                continue
+            if msg.startswith("Expecting") and pos < len(candidate) and candidate[pos] in "]}":
+                # 不該出現的結尾括號 → 刪掉
+                candidate = candidate[:pos] + candidate[pos + 1 :]
+                continue
+            if msg.startswith("Expecting") and 0 < pos <= len(candidate) and candidate[pos - 1] == '"' and pos < len(candidate):
+                # 字串內未跳脫的引號：把前一個引號跳脫掉
+                candidate = candidate[: pos - 1] + '\\"' + candidate[pos:]
+                continue
+            if msg.startswith("Unterminated string") or (msg.startswith("Expecting") and pos >= len(candidate)):
+                # 輸出被截斷：補上缺少的結尾
+                candidate = _close_truncated(candidate)
+                continue
+            break
+    assert last_error is not None
+    raise last_error
+
+
+def _close_truncated(text: str) -> str:
+    """依括號堆疊補上缺少的結尾 (給被截斷的 JSON 用)。"""
+    stack: List[str] = []
+    in_str = False
+    escape = False
+    for ch in text:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "[{":
+            stack.append("]" if ch == "[" else "}")
+        elif ch in "]}" and stack:
+            stack.pop()
+    text = text.rstrip()
+    if in_str:
+        text += '"'
+    text = re.sub(r",\s*$", "", text)
+    return text + "".join(reversed(stack))
+
+
+def parse_briefing(content: str) -> DailyBriefing:
+    """從模型回覆取出 JSON、必要時修復，再驗證成 DailyBriefing。"""
+    raw = extract_json(content)
+    try:
+        return DailyBriefing.model_validate_json(raw)
+    except Exception:
+        repaired = repair_json(raw)
+        return DailyBriefing.model_validate_json(repaired)
+
+
+def save_debug(label: str, content: str, error: Exception) -> Optional[Path]:
+    """把解析失敗的原始回覆存檔供診斷；存不了就略過。"""
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEBUG_DIR / f"llm-raw-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{label}.txt"
+        path.write_text(f"# error: {error}\n\n{content}", encoding="utf-8")
+        return path
+    except Exception:
+        return None
 
 
 def _build_user_prompt(batch: List[dict]) -> str:
@@ -398,13 +496,14 @@ def _call_prompt_mode(client, batch: List[dict], max_attempts: int = 2) -> Daily
         {"role": "user", "content": _build_user_prompt(batch)},
     ]
     last_error: Optional[Exception] = None
-    for _ in range(max_attempts):
+    for attempt in range(1, max_attempts + 1):
         completion = client.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0)
         content = completion.choices[0].message.content or ""
         try:
-            return DailyBriefing.model_validate_json(extract_json(content))
-        except Exception as e:  # JSON 壞掉或欄位不符：把錯誤回饋給模型再試一次
+            return parse_briefing(content)
+        except Exception as e:  # JSON 修不好或欄位不符：存檔、把錯誤回饋給模型再試一次
             last_error = e
+            save_debug(f"batch{len(batch)}-try{attempt}", content, e)
             messages = messages + [
                 {"role": "assistant", "content": content},
                 {"role": "user", "content": f"你的輸出無法解析：{e}\n請只輸出修正後、完整且合法的 JSON 物件。"},
@@ -412,7 +511,41 @@ def _call_prompt_mode(client, batch: List[dict], max_attempts: int = 2) -> Daily
     raise RuntimeError(f"LLM 回覆無法解析為結構化結果: {last_error}")
 
 
-def analyze_emails_with_llm(emails: List[dict]) -> Optional[DailyBriefing]:
+FAILED_MARK = "⚠️ 分析失敗"
+
+
+def _failed_summary(mail: dict, error: Exception) -> EmailSummary:
+    """單封信分析失敗時的佔位結果，讓報告仍列出這封信而不是整次中止。"""
+    return EmailSummary(
+        subject=mail["subject"],
+        sender=mail["sender"],
+        date_str=mail["date_str"],
+        summary=f"{FAILED_MARK}：{str(error).splitlines()[0][:120]}",
+        action_items=["請直接開啟原信閱讀處理"],
+        strategy_advice="模型回覆無法解析，原始回覆已存到 debug 目錄 (mail-agent status 可查看路徑)。",
+    )
+
+
+def _analyze_batch(call, client, batch: List[dict], on_progress: Optional[Callable[[str], None]] = None) -> List[EmailSummary]:
+    """整批分析；失敗時退化為逐封分析，單封仍失敗則放入佔位結果。"""
+    try:
+        return list(call(client, batch).briefings)
+    except Exception as batch_error:
+        if len(batch) == 1:
+            if on_progress:
+                on_progress(f"「{batch[0]['subject']}」分析失敗：{str(batch_error).splitlines()[0][:80]}")
+            return [_failed_summary(batch[0], batch_error)]
+        if on_progress:
+            on_progress(f"整批 {len(batch)} 封解析失敗，改為逐封分析")
+        results: List[EmailSummary] = []
+        for mail in batch:
+            results.extend(_analyze_batch(call, client, [mail], on_progress))
+        return results
+
+
+def analyze_emails_with_llm(
+    emails: List[dict], on_progress: Optional[Callable[[str], None]] = None
+) -> Optional[DailyBriefing]:
     if not emails:
         return None
 
@@ -429,7 +562,9 @@ def analyze_emails_with_llm(emails: List[dict]) -> Optional[DailyBriefing]:
     all_briefings: List[EmailSummary] = []
     for start in range(0, len(emails), BATCH_SIZE):
         batch = emails[start : start + BATCH_SIZE]
-        all_briefings.extend(call(client, batch).briefings)
+        if on_progress and len(emails) > BATCH_SIZE:
+            on_progress(f"分析第 {start + 1}–{start + len(batch)} 封 (共 {len(emails)} 封)")
+        all_briefings.extend(_analyze_batch(call, client, batch, on_progress))
 
     return DailyBriefing(total_processed=len(all_briefings), briefings=all_briefings)
 
@@ -580,7 +715,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     reports: List[tuple[str, DailyBriefing]] = []
     for account, mails in mails_by_account:
         try:
-            report = analyze_emails_with_llm(mails)
+            report = analyze_emails_with_llm(mails, on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True))
         except Exception as e:
             print(f"❌ 分析 [{account}] 郵件時發生錯誤: {e}")
             return 1
@@ -589,9 +724,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
         reports.append((account, report))
 
+    failed = []
     for account, report in reports:
         print(f"\n📮 帳號: {account}")
         print_report(report)
+        failed.extend(f"[{account}] {b.subject}" for b in report.briefings if b.summary.startswith(FAILED_MARK))
+
+    if failed:
+        print(f"\n⚠️ 有 {len(failed)} 封信模型回覆無法解析，請直接開啟原信處理 (原始回覆存於 {DEBUG_DIR})：")
+        for f in failed:
+            print(f"   - {f}")
 
     save_last_sync_time(run_started_at)
     print(f"\n✅ 處理完成，已更新同步時間點為: {run_started_at.strftime(TIME_FORMAT)}")

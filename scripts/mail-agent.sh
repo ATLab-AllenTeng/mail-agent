@@ -268,6 +268,9 @@ cmd_status() {
   else
     echo "○ 最近執行    尚無紀錄"
   fi
+  local debug_dir="${STATE_DIR}/debug" n
+  n="$(ls -1 "${debug_dir}" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n}" != "0" ] && ylw "● 解析失敗紀錄 ${n} 份（${debug_dir}，可安心刪除）"
   echo
   echo "LOG_DIR = ${LOG_DIR}"
 }

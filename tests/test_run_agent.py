@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 import tempfile
@@ -276,6 +277,96 @@ class DotenvTests(unittest.TestCase):
             self.assertEqual(run_agent.setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL"), "Mail-Briefing")
         with mock.patch.dict(run_agent.os.environ, {}, clear=True):
             self.assertEqual(run_agent.setting("MAIL_AGENT_MODEL", "gpt-4o", fallback="OPENAI_MODEL"), "gpt-4o")
+
+
+class RepairJsonTests(unittest.TestCase):
+    def _ok(self, text):
+        return json.loads(run_agent.repair_json(text))
+
+    def test_valid_passthrough(self):
+        self.assertEqual(self._ok('{"a": [1, 2]}'), {"a": [1, 2]})
+
+    def test_extra_closing_bracket(self):
+        # 實際案例：Apple Intelligence 在 briefings 結尾多了一個 ]
+        self.assertEqual(self._ok('{"n": 2, "b": [{"a": 1}, {"c": "x"}]]}'), {"n": 2, "b": [{"a": 1}, {"c": "x"}]})
+        self.assertEqual(self._ok('{"a": 1}}'), {"a": 1})
+
+    def test_unescaped_quote_inside_string(self):
+        self.assertEqual(self._ok('{"s": "回覆："方向 OK"，請修正", "x": 1}'), {"s": '回覆："方向 OK"，請修正', "x": 1})
+
+    def test_raw_newline_and_trailing_comma(self):
+        self.assertEqual(self._ok('{"s": "a\nb", "l": ["x",], "x": 1,}'), {"s": "a\nb", "l": ["x"], "x": 1})
+
+    def test_truncated_output(self):
+        self.assertEqual(self._ok('{"n": 1, "b": [{"s": "S", "items": ["a", "b"'), {"n": 1, "b": [{"s": "S", "items": ["a", "b"]}]})
+        self.assertEqual(self._ok('{"s": "未結束的字串'), {"s": "未結束的字串"})
+
+    def test_unrepairable_raises(self):
+        with self.assertRaises(json.JSONDecodeError):
+            run_agent.repair_json("{this is not json at all")
+
+    def test_parse_briefing_repairs(self):
+        broken = VALID_JSON[:-1] + "]}"  # 多一個 ]
+        report = run_agent.parse_briefing("```json\n" + broken + "\n```")
+        self.assertEqual(report.briefings[0].subject, "S")
+
+
+class BatchFallbackTests(unittest.TestCase):
+    batch = [
+        {"subject": "S1", "sender": "F", "date_str": "D", "body": "B"},
+        {"subject": "S2", "sender": "F", "date_str": "D", "body": "B"},
+    ]
+
+    def _briefing(self, subject):
+        return run_agent.DailyBriefing(total_processed=1, briefings=[run_agent.EmailSummary(
+            subject=subject, sender="F", date_str="D", summary="ok", action_items=[], strategy_advice="adv")])
+
+    def test_batch_failure_falls_back_to_single_mails(self):
+        calls = []
+
+        def call(client, batch):
+            calls.append([m["subject"] for m in batch])
+            if len(batch) > 1:
+                raise RuntimeError("batch broken")
+            return self._briefing(batch[0]["subject"])
+
+        progress = []
+        out = run_agent._analyze_batch(call, None, self.batch, progress.append)
+        self.assertEqual([b.subject for b in out], ["S1", "S2"])
+        self.assertEqual(calls, [["S1", "S2"], ["S1"], ["S2"]])
+        self.assertTrue(any("逐封" in p for p in progress))
+
+    def test_single_mail_failure_becomes_placeholder(self):
+        def call(client, batch):
+            if any(m["subject"] == "S2" for m in batch):
+                raise RuntimeError("still broken")
+            return self._briefing(batch[0]["subject"])
+
+        out = run_agent._analyze_batch(call, None, self.batch)
+        self.assertEqual(out[0].summary, "ok")
+        self.assertTrue(out[1].summary.startswith(run_agent.FAILED_MARK))
+        self.assertEqual(out[1].subject, "S2")
+
+    def test_main_reports_failed_mails_and_still_saves_sync(self):
+        report = run_agent.DailyBriefing(total_processed=2, briefings=[
+            self._briefing("S1").briefings[0],
+            run_agent._failed_summary(self.batch[1], RuntimeError("x")),
+        ])
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(run_agent, "CONFIG_FILE", Path(d) / "last_sync.json"), \
+             mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=self.batch), \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=report), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 0)
+            self.assertTrue((Path(d) / "last_sync.json").exists())
+        self.assertIn("有 1 封信模型回覆無法解析", out.getvalue())
+        self.assertIn("S2", out.getvalue())
+
+    def test_save_debug_writes_file(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(run_agent, "DEBUG_DIR", Path(d)):
+            path = run_agent.save_debug("t", "raw content", RuntimeError("boom"))
+            self.assertTrue(path.exists())
+            self.assertIn("raw content", path.read_text())
 
 
 class MainFlowTests(unittest.TestCase):
