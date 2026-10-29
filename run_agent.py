@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -100,11 +101,31 @@ BATCH_SIZE = int(os.environ.get("MAIL_AGENT_BATCH_SIZE", "10"))
 # LLM 回覆解析失敗時，原始回覆存到這裡供診斷 (預設 ~/.mail-agent/debug)
 DEBUG_DIR = Path(os.environ.get("MAIL_AGENT_DEBUG_DIR", str(Path.home() / ".mail-agent" / "debug")))
 
+# ── 附件 ──────────────────────────────────────────────────────────────
+# 附件由郵件 App 存到暫存目錄，再交給 docconvert (https://github.com/ATLab-AllenTeng/docconvert)
+# 轉成 Markdown 接在信件內文後。隱私原則：docconvert 一律「不加 --vlm」，附件只做純文字抽取
+# (pdftotext / mammoth / SheetJS 等本機確定性路徑)，絕不把附件內容或圖片送到任何視覺模型；
+# 圖片附件 (簽名檔、截圖) 連轉換都不做，只列檔名。
+SKIP_ATTACHMENTS = os.environ.get("MAIL_AGENT_SKIP_ATTACHMENTS", "").strip().lower() in ("1", "true", "yes", "on")
+# docconvert 可執行檔；找不到時退回 node ~/src/docconvert/bin/docconvert.mjs，再找不到就只列附件檔名
+DOCCONVERT_BIN = setting("MAIL_AGENT_DOCCONVERT_BIN", str(Path.home() / ".local" / "bin" / "docconvert"))
+DOCCONVERT_FALLBACK_SCRIPT = Path.home() / "src" / "docconvert" / "bin" / "docconvert.mjs"
+# 每個附件送出的 Markdown 字元上限、單封信附件轉換的逾時秒數
+MAX_ATTACHMENT_CHARS = int(os.environ.get("MAIL_AGENT_MAX_ATTACHMENT_CHARS", "3000"))
+DOCCONVERT_TIMEOUT = int(os.environ.get("MAIL_AGENT_DOCCONVERT_TIMEOUT", "600"))
+# 附件暫存根目錄；每次執行建立 <root>/<run-id>/<帳號>/<信件序號>/，處理完即刪除 (轉換失敗的保留供除錯)
+ATTACHMENT_ROOT = Path(os.environ.get("MAIL_AGENT_ATTACHMENT_DIR", str(Path.home() / ".mail-agent" / "attachments")))
+# 圖片附件只列檔名、不轉換 (無 VLM 時 docconvert 也只會回傳佔位文字)
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".svg", ".ico"}
+
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # AppleScript 輸出用的分隔字元 (ASCII 30 = record separator, 31 = unit separator)
 RECORD_SEP = "\x1e"
 FIELD_SEP = "\x1f"
+# 內文之後、附件清單之前的分隔字元 (ASCII 29 = group separator)；附件之間用 ASCII 28 (file separator)
+ATTACH_BLOCK_SEP = "\x1d"
+ATTACH_SEP = "\x1c"
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +256,84 @@ def inbox_candidates(mailbox: str = TARGET_MAILBOX) -> List[str]:
     return names
 
 
+def _applescript_attachment_block(list_attachments: bool, attachment_dir: Optional[Path]) -> str:
+    """產生每封信附件處理的 AppleScript 片段：列出名稱/大小，必要時存檔到暫存目錄。
+
+    每個附件輸出 name FS size FS savedPath，附件之間以 ASEP (ASCII 28) 分隔；
+    存檔失敗 (未下載、檔名異常) 時 savedPath 留空，Python 端只列檔名。
+    檔名先經 safeName 去掉 / 與 :，再加上序號避免同名附件互相覆蓋。
+    """
+    if not list_attachments:
+        return 'set attInfo to ""'
+    save_block = ""
+    if attachment_dir is not None:
+        root = _applescript_string(str(attachment_dir))
+        # 圖片 (簽名檔、內嵌圖) 依隱私政策不讀取，連存檔都省掉；AppleScript 的 ends with 預設不分大小寫
+        save_block = f"""
+                    if not (my isImageName(attName)) then
+                        try
+                            set mailDir to "{root}/" & i
+                            my ensureDir(mailDir)
+                            set savedPath to mailDir & "/" & attIndex & "-" & (my safeName(attName))
+                            try
+                                save att in (POSIX file savedPath)
+                            on error
+                                save att in file ((POSIX file savedPath) as text)
+                            end try
+                        on error errMsg
+                            set savedPath to ""
+                            log "{PROGRESS_PREFIX}附件「" & attName & "」無法儲存: " & errMsg
+                        end try
+                    end if"""
+    return f"""
+            set attInfo to ""
+            try
+                set attIndex to 0
+                repeat with att in (mail attachments of m)
+                    set attIndex to attIndex + 1
+                    set attName to ""
+                    try
+                        set attName to (name of att) as text
+                    end try
+                    set attSize to 0
+                    try
+                        set attSize to (file size of att) as integer
+                    end try
+                    set savedPath to ""{save_block}
+                    set attInfo to attInfo & attName & FS & (attSize as text) & FS & savedPath & ASEP
+                end repeat
+            end try"""
+
+
+APPLESCRIPT_HELPERS = """
+on safeName(n)
+    set n to n as text
+    set oldDelims to AppleScript's text item delimiters
+    repeat with badChar in {"/", ":"}
+        set AppleScript's text item delimiters to (contents of badChar)
+        set partsList to text items of n
+        set AppleScript's text item delimiters to "_"
+        set n to partsList as text
+    end repeat
+    set AppleScript's text item delimiters to oldDelims
+    if n is "" then set n to "attachment"
+    if (length of n) > 150 then set n to text (-150) thru -1 of n
+    return n
+end safeName
+
+on ensureDir(p)
+    do shell script "mkdir -p " & quoted form of p
+end ensureDir
+
+on isImageName(n)
+    repeat with ext in imageExtensions
+        if n ends with (contents of ext) then return true
+    end repeat
+    return false
+end isImageName
+"""
+
+
 def fetch_unflagged_inbox_mails(
     account_name: str,
     since: Optional[datetime] = None,
@@ -242,19 +341,28 @@ def fetch_unflagged_inbox_mails(
     include_body: bool = True,
     limit: Optional[int] = None,
     on_progress: Optional[Callable[[str], None]] = None,
+    list_attachments: bool = True,
+    attachment_dir: Optional[Path] = None,
 ) -> List[dict]:
     """讀取指定帳號收件夾中「無旗標」且 (若提供) 「晚於 since」的信件。
 
     include_body=False 時不讀取內文 (快很多，供 dry-run 使用)；
     limit 限制最多讀取幾封，依郵件 App 回傳的順序取前 N 封 (通常最新的在前)。
+    list_attachments=True 時輸出每封信的附件名稱與大小；再給 attachment_dir 則把附件
+    存到 <attachment_dir>/<信件序號>/<附件序號>-<檔名>，供 docconvert 轉換。
     """
     acct = _applescript_string(account_name)
     candidates = _applescript_list(inbox_candidates(mailbox))
     limit_value = int(limit) if limit and limit > 0 else 0
     body_expr = "content of m" if include_body else '""'
+    attachment_block = _applescript_attachment_block(list_attachments, attachment_dir)
     script = f"""
     set RS to string id 30
     set FS to string id 31
+    set GS to string id 29
+    set ASEP to string id 28
+    global imageExtensions
+    set imageExtensions to {_applescript_list(sorted(IMAGE_EXTENSIONS))}
     set inboxNames to {candidates}
     set limitCount to {limit_value}
     {_applescript_cutoff(since)}
@@ -297,18 +405,42 @@ def fetch_unflagged_inbox_mails(
             try
                 set mailContent to {body_expr}
             end try
-            set output to output & mailSubject & FS & mailSender & FS & mailDate & FS & mailContent & RS
+            {attachment_block}
+            set output to output & mailSubject & FS & mailSender & FS & mailDate & FS & mailContent & GS & attInfo & RS
             if i mod 10 = 0 or i = totalCount then
                 log "{PROGRESS_PREFIX}已讀取 " & i & "/" & totalCount & " 封"
             end if
         end repeat
         return output
     end tell
+    {APPLESCRIPT_HELPERS}
     """
     return parse_mail_output(run_applescript(script, on_progress=on_progress))
 
 
+def parse_attachment_block(raw: str) -> List[dict]:
+    """解析 AppleScript 輸出的附件清單：每筆 name FS size FS path，以 ATTACH_SEP 分隔。"""
+    attachments: List[dict] = []
+    for index, entry in enumerate(raw.split(ATTACH_SEP), 1):
+        if not entry.strip():
+            continue
+        parts = entry.split(FIELD_SEP)
+        name = parts[0].strip() or f"attachment-{index}"
+        try:
+            size = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip() else 0
+        except ValueError:
+            size = 0
+        path = parts[2].strip() if len(parts) > 2 else ""
+        attachments.append({"name": name, "size": size, "path": path, "status": "saved" if path else "unsaved"})
+    return attachments
+
+
 def parse_mail_output(raw: str) -> List[dict]:
+    """把 AppleScript 輸出解析成信件清單。
+
+    每筆 record：subject FS sender FS date FS body [GS attachments]。
+    內文可能含 FS，所以第 4 欄之後全部併回內文；附件區塊 (若有) 在最後一個 GS 之後。
+    """
     emails: List[dict] = []
     for record in raw.split(RECORD_SEP):
         if not record.strip():
@@ -317,16 +449,244 @@ def parse_mail_output(raw: str) -> List[dict]:
         if len(parts) < 4:
             continue
         subject, sender, date_str = (p.strip() for p in parts[:3])
-        body = FIELD_SEP.join(parts[3:]).strip()
+        body = FIELD_SEP.join(parts[3:])
+        attachments: List[dict] = []
+        if ATTACH_BLOCK_SEP in body:
+            body, _, attachment_block = body.rpartition(ATTACH_BLOCK_SEP)
+            attachments = parse_attachment_block(attachment_block)
         emails.append(
             {
                 "subject": subject or "(無主旨)",
                 "sender": sender,
                 "date_str": date_str,
-                "body": body[:MAX_BODY_CHARS],
+                "body": body.strip()[:MAX_BODY_CHARS],
+                "attachments": attachments,
             }
         )
     return emails
+
+
+# ---------------------------------------------------------------------------
+# 附件轉換 (docconvert)
+# ---------------------------------------------------------------------------
+def resolve_docconvert_command(
+    bin_path: str = DOCCONVERT_BIN, fallback_script: Path = DOCCONVERT_FALLBACK_SCRIPT
+) -> Optional[List[str]]:
+    """決定 docconvert 的呼叫方式：MAIL_AGENT_DOCCONVERT_BIN → node + docconvert.mjs → None (找不到)。"""
+    candidate = Path(os.path.expanduser(bin_path))
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return [str(candidate)]
+    found = shutil.which(bin_path)
+    if found:
+        return [found]
+    node = shutil.which("node")
+    if node and fallback_script.is_file():
+        return [node, str(fallback_script)]
+    return None
+
+
+def docconvert_missing_hint() -> str:
+    return (
+        f"找不到 docconvert (MAIL_AGENT_DOCCONVERT_BIN={DOCCONVERT_BIN}，備援 node {DOCCONVERT_FALLBACK_SCRIPT})，"
+        "附件只會列出檔名、不讀取內容。安裝：git clone https://github.com/ATLab-AllenTeng/docconvert.git ~/src/docconvert "
+        "&& ~/src/docconvert/scripts/docconvert.sh install；或設 MAIL_AGENT_SKIP_ATTACHMENTS=1 關掉附件處理。"
+    )
+
+
+def _failed_conversions(paths: List[str], error: str) -> dict:
+    return {p: {"ok": False, "markdown": "", "error": error, "warnings": [], "converter": None} for p in paths}
+
+
+def convert_attachments(
+    paths: List[str],
+    command: Optional[List[str]] = None,
+    timeout: int = DOCCONVERT_TIMEOUT,
+) -> dict:
+    """用 docconvert 把附件轉成 Markdown，回傳 {路徑: {ok, markdown, error, warnings, converter}}。
+
+    刻意「不加 --vlm」：附件只走本機純文字抽取 (pdftotext、mammoth、SheetJS…)，
+    任何內容都不會送到視覺模型；這是 Allen 對信件附件隱私的明確要求，請勿改動。
+    任何失敗 (找不到程式、逾時、輸出不是 JSON) 都不拋出例外，而是每個路徑各給一筆 ok=False。
+    """
+    if not paths:
+        return {}
+    if command is None:
+        command = resolve_docconvert_command()
+    if not command:
+        return _failed_conversions(paths, "找不到 docconvert")
+    argv = [*command, "--json", "--quiet", *paths]  # 絕對不要加 --vlm
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return _failed_conversions(paths, f"docconvert 超過 {timeout} 秒未完成")
+    except OSError as e:
+        return _failed_conversions(paths, f"無法執行 docconvert: {e}")
+    try:
+        data = json.loads(proc.stdout)
+        files = data["files"]
+    except (ValueError, KeyError, TypeError):
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return _failed_conversions(paths, "docconvert 輸出不是預期的 JSON" + (f": {detail[-1][:200]}" if detail else ""))
+
+    def _key(p: str) -> str:
+        return os.path.realpath(p)
+
+    by_source = {_key(f.get("source", "")): f for f in files if isinstance(f, dict)}
+    results = {}
+    for index, path in enumerate(paths):
+        entry = by_source.get(_key(path))
+        if entry is None and index < len(files):
+            entry = files[index]  # source 比不上就依順序對應
+        if entry is None:
+            results[path] = {"ok": False, "markdown": "", "error": "docconvert 未回傳此檔案的結果", "warnings": [], "converter": None}
+            continue
+        results[path] = {
+            "ok": bool(entry.get("ok")),
+            "markdown": entry.get("markdown") or "",
+            "error": entry.get("error") or "",
+            "warnings": list(entry.get("warnings") or []),
+            "converter": entry.get("converter"),
+        }
+    return results
+
+
+def truncate_text(text: str, limit: int) -> str:
+    """截到 limit 字元，並註明原始長度。"""
+    text = text.strip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n…(附件內容已截斷，原長 {len(text)} 字)"
+
+
+def strip_title_line(markdown: str, path: str) -> str:
+    """docconvert 會以暫存檔名 (含序號前綴) 當第一行標題；提示詞已標明原始檔名，這行去掉。"""
+    first, sep, rest = markdown.lstrip().partition("\n")
+    if first.strip() == f"# {Path(path).name}":
+        return rest
+    return markdown
+
+
+def is_image_attachment(name: str) -> bool:
+    return Path(name).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def attach_attachment_contents(
+    mails: List[dict],
+    command: Optional[List[str]] = None,
+    max_chars: int = MAX_ATTACHMENT_CHARS,
+    on_progress: Optional[Callable[[str], None]] = None,
+) -> None:
+    """就地把每封信已存檔的附件轉成 Markdown，寫回 attachment["content"] 與 attachment["status"]。
+
+    status：converted / failed (保留檔案供除錯) / unsupported / image / unsaved / no-converter。
+    一封信一次 docconvert 呼叫，單封失敗或逾時不影響其他信。
+    """
+    for index, mail in enumerate(mails, 1):
+        attachments = mail.get("attachments") or []
+        pending = []
+        for att in attachments:
+            if is_image_attachment(att["name"]):
+                att["status"] = "image"
+            elif not att.get("path"):
+                att["status"] = "unsaved"
+            elif command is None:
+                att["status"] = "no-converter"
+            else:
+                pending.append(att)
+        if not pending:
+            continue
+        if on_progress:
+            on_progress(f"轉換第 {index} 封「{mail['subject']}」的 {len(pending)} 個附件...")
+        results = convert_attachments([att["path"] for att in pending], command=command)
+        for att in pending:
+            result = results.get(att["path"]) or {"ok": False, "error": "沒有結果", "converter": None, "markdown": ""}
+            if result["ok"]:
+                att["status"] = "converted"
+                att["content"] = truncate_text(strip_title_line(result["markdown"], att["path"]), max_chars)
+            elif result.get("converter") is None and "不支援" in (result.get("error") or ""):
+                att["status"] = "unsupported"
+                att["error"] = result["error"]
+            else:
+                att["status"] = "failed"
+                att["error"] = result.get("error") or "轉換失敗"
+
+
+def format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+ATTACHMENT_STATUS_LABEL = {
+    "converted": "已擷取內容",
+    "image": "圖片略過",
+    "unsupported": "格式不支援",
+    "failed": "擷取失敗",
+    "unsaved": "無法取出",
+    "no-converter": "未安裝 docconvert",
+    "listed": "僅列檔名",
+}
+
+ATTACHMENT_STATUS_NOTE = {
+    "image": "圖片，依隱私政策不讀取內容",
+    "unsupported": "格式不支援，未讀取內容",
+    "failed": "內容擷取失敗",
+    "unsaved": "無法從郵件 App 取出，未讀取內容",
+    "no-converter": "未安裝 docconvert，未讀取內容",
+    "listed": "未讀取內容",
+}
+
+
+def mail_for_prompt(mail: dict) -> dict:
+    """送進提示詞的信件：內文後接「附件：<檔名>」區塊；不含本機路徑等與分析無關的欄位。"""
+    body = mail.get("body", "")
+    blocks: List[str] = []
+    for att in mail.get("attachments") or []:
+        header = f"附件：{att['name']}"
+        if att.get("size"):
+            header += f" ({format_size(att['size'])})"
+        if att.get("status") == "converted" and att.get("content"):
+            blocks.append(f"{header}\n{att['content']}")
+        else:
+            note = ATTACHMENT_STATUS_NOTE.get(att.get("status", "listed"), ATTACHMENT_STATUS_NOTE["listed"])
+            blocks.append(f"{header} — {note}")
+    if blocks:
+        body = (body + "\n\n" if body else "") + "\n\n".join(blocks)
+    return {
+        "subject": mail.get("subject", ""),
+        "sender": mail.get("sender", ""),
+        "date_str": mail.get("date_str", ""),
+        "body": body,
+    }
+
+
+def cleanup_attachment_dir(run_dir: Path, mails_by_account: List[tuple]) -> List[Path]:
+    """刪除本次執行的附件暫存目錄；含轉換失敗附件的信件目錄保留供除錯，回傳保留的目錄清單。"""
+    keep_dirs: List[Path] = []
+    for _, mails in mails_by_account:
+        for mail in mails:
+            for att in mail.get("attachments") or []:
+                if att.get("status") == "failed" and att.get("path"):
+                    keep_dirs.append(Path(att["path"]).parent)
+    kept = sorted({str(d) for d in keep_dirs})
+    if not run_dir.exists():
+        return [Path(d) for d in kept]
+    for root, dirs, files in os.walk(run_dir, topdown=False):
+        root_path = Path(root)
+        if str(root_path) in kept:
+            continue
+        for name in files:
+            try:
+                (root_path / name).unlink()
+            except OSError:
+                pass
+        try:
+            root_path.rmdir()  # 底下還有保留目錄時會失敗，正是我們要的
+        except OSError:
+            pass
+    return [Path(d) for d in kept]
 
 
 # ---------------------------------------------------------------------------
@@ -460,11 +820,19 @@ def save_debug(label: str, content: str, error: Exception) -> Optional[Path]:
 
 
 def _build_user_prompt(batch: List[dict]) -> str:
+    payload = [mail_for_prompt(m) for m in batch]
+    has_attachments = any(m.get("attachments") for m in batch)
+    note = (
+        "信件內文之後若有「附件：<檔名>」區塊，是該附件的純文字內容 (可能已截斷)，請一併納入摘要與待辦判斷。\n\n"
+        if has_attachments
+        else ""
+    )
     return (
         "請閱讀以下來自公司收件匣的最新郵件，為使用者進行重點摘要、"
         "萃取行動事項，並提供具體切實的應對方針建議。\n\n"
+        f"{note}"
         f"郵件資料 (共 {len(batch)} 封):\n"
-        f"{json.dumps(batch, ensure_ascii=False, indent=2)}"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
 
@@ -599,11 +967,33 @@ def print_raw_mails(mails: List[dict]) -> None:
         if m["body"]:
             preview = m["body"].replace("\n", " ")[:120]
             print(f" 📄 內文預覽: {preview}")
+        attachments = m.get("attachments") or []
+        if attachments:
+            print(f" 📎 附件 ({len(attachments)}):")
+            for att in attachments:
+                print(f"    - {att['name']} ({format_size(att.get('size', 0))})")
+
+
+def attachment_summary(mails_by_account: List[tuple]) -> dict:
+    """統計各狀態的附件數量，供報告尾端顯示。"""
+    counts: dict = {}
+    for _, mails in mails_by_account:
+        for mail in mails:
+            for att in mail.get("attachments") or []:
+                status = att.get("status", "listed")
+                counts[status] = counts.get(status, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------
 # 主執行流程
 # ---------------------------------------------------------------------------
+def account_slug(account: str) -> str:
+    """帳號名稱轉成可當目錄名的字串。"""
+    slug = re.sub(r"[^\w.-]+", "_", account.strip(), flags=re.UNICODE).strip("_")
+    return slug or "account"
+
+
 def split_accounts(value: str) -> List[str]:
     """把逗號分隔的帳號字串拆成清單，去除空白與重複。"""
     seen: List[str] = []
@@ -673,6 +1063,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 在抓信「之前」記下本次時間點，避免漏掉執行期間抵達的信件
     run_started_at = datetime.now().replace(microsecond=0)
 
+    # 附件：dry-run 只列名稱與大小；正常執行存到 <ATTACHMENT_ROOT>/<run-id>/<帳號>/ 再轉換
+    attachments_enabled = not SKIP_ATTACHMENTS
+    run_attachment_dir: Optional[Path] = None
+    if attachments_enabled and not args.dry_run:
+        run_attachment_dir = ATTACHMENT_ROOT / run_started_at.strftime("%Y%m%d-%H%M%S")
+    if not attachments_enabled:
+        print("📎 附件處理已由 MAIL_AGENT_SKIP_ATTACHMENTS 關閉")
+
     # 先把所有帳號的信都抓完，再進行分析
     mails_by_account: List[tuple[str, List[dict]]] = []
     for account in accounts:
@@ -684,6 +1082,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 include_body=not args.dry_run,
                 limit=args.limit,
                 on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True),
+                list_attachments=attachments_enabled,
+                attachment_dir=(run_attachment_dir / account_slug(account)) if run_attachment_dir else None,
             )
         except RuntimeError as e:
             print(f"❌ 讀取 [{account}] 郵件失敗: {e}")
@@ -709,20 +1109,48 @@ def main(argv: Optional[List[str]] = None) -> int:
         for account, mails in mails_by_account:
             print(f"\n📮 帳號: {account} ({len(mails)} 封)")
             print_raw_mails(mails)
+        total_attachments = sum(len(m.get("attachments") or []) for _, mails in mails_by_account for m in mails)
+        if attachments_enabled:
+            print(f"\n📎 共 {total_attachments} 個附件 (dry-run 只列檔名與大小，未存檔、未轉換)")
         print("\n(dry-run 模式：未讀取內文、未呼叫 LLM，也未更新同步時間點)")
         return 0
 
-    reports: List[tuple[str, DailyBriefing]] = []
-    for account, mails in mails_by_account:
-        try:
-            report = analyze_emails_with_llm(mails, on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True))
-        except Exception as e:
-            print(f"❌ 分析 [{account}] 郵件時發生錯誤: {e}")
-            return 1
-        if report is None:
-            print(f"❌ LLM 未產出 [{account}] 的報告")
-            return 1
-        reports.append((account, report))
+    # 附件轉換：docconvert 不加 --vlm，純文字抽取；找不到 docconvert 就只列檔名
+    if attachments_enabled:
+        all_attachments = [att for _, mails in mails_by_account for m in mails for att in m.get("attachments") or []]
+        if all_attachments:
+            images = sum(1 for att in all_attachments if is_image_attachment(att["name"]))
+            convertible = [att for att in all_attachments if att.get("path") and not is_image_attachment(att["name"])]
+            command = resolve_docconvert_command() if convertible else None
+            if convertible and command is None:
+                print(f"⚠️ {docconvert_missing_hint()}")
+            elif convertible:
+                print(
+                    f"📎 共 {len(all_attachments)} 個附件：{len(convertible)} 個交給 docconvert 抽取純文字 (不送視覺模型)"
+                    + (f"，{images} 張圖片只列檔名" if images else "")
+                )
+            else:
+                print(f"📎 共 {len(all_attachments)} 個附件，全部是圖片或無法取出，只列檔名")
+            for _, mails in mails_by_account:
+                attach_attachment_contents(mails, command=command, on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True))
+
+    kept_dirs: List[Path] = []
+    try:
+        reports: List[tuple[str, DailyBriefing]] = []
+        for account, mails in mails_by_account:
+            try:
+                report = analyze_emails_with_llm(mails, on_progress=lambda msg: print(f"   ⏳ {msg}", flush=True))
+            except Exception as e:
+                print(f"❌ 分析 [{account}] 郵件時發生錯誤: {e}")
+                return 1
+            if report is None:
+                print(f"❌ LLM 未產出 [{account}] 的報告")
+                return 1
+            reports.append((account, report))
+    finally:
+        # 不論成功失敗都刪掉附件暫存 (隱私)，只保留轉換失敗的那幾封供除錯
+        if run_attachment_dir is not None:
+            kept_dirs = cleanup_attachment_dir(run_attachment_dir, mails_by_account)
 
     failed = []
     for account, report in reports:
@@ -734,6 +1162,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n⚠️ 有 {len(failed)} 封信模型回覆無法解析，請直接開啟原信處理 (原始回覆存於 {DEBUG_DIR})：")
         for f in failed:
             print(f"   - {f}")
+
+    counts = attachment_summary(mails_by_account)
+    if counts:
+        parts = [f"{ATTACHMENT_STATUS_LABEL.get(k, k)} {v}" for k, v in sorted(counts.items())]
+        print(f"\n📎 附件處理: {', '.join(parts)}")
+        failed_attachments = [
+            f"[{account}] {m['subject']} — {att['name']}: {att.get('error', '')}"
+            for account, mails in mails_by_account
+            for m in mails
+            for att in m.get("attachments") or []
+            if att.get("status") == "failed"
+        ]
+        for line in failed_attachments:
+            print(f"   - {line}")
+        if kept_dirs:
+            print("   轉換失敗的附件已保留供除錯 (確認後可刪除)：")
+            for d in kept_dirs:
+                print(f"     {d}")
 
     save_last_sync_time(run_started_at)
     print(f"\n✅ 處理完成，已更新同步時間點為: {run_started_at.strftime(TIME_FORMAT)}")

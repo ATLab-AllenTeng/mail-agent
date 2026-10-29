@@ -100,7 +100,7 @@ class AppleScriptBuildTests(unittest.TestCase):
 
         with mock.patch.object(run_agent, "run_applescript", fake_run):
             mails = run_agent.fetch_unflagged_inbox_mails("My Exchange", since=datetime(2026, 1, 2, 3, 4, 5))
-        self.assertEqual(mails, [{"subject": "S", "sender": "F", "date_str": "D", "body": "B"}])
+        self.assertEqual(mails, [{"subject": "S", "sender": "F", "date_str": "D", "body": "B", "attachments": []}])
         self.assertIn('account "My Exchange"', captured["script"])
         self.assertIn('set inboxNames to {"INBOX", "Inbox", "收件匣", "收件夹", "受信"}', captured["script"])
         self.assertIn("is in inboxNames", captured["script"])
@@ -453,6 +453,426 @@ class MainFlowTests(unittest.TestCase):
         with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=[]) as fetch:
             run_agent.main(["--all"])
         self.assertIsNone(fetch.call_args.kwargs["since"])
+
+
+GS, ASEP = run_agent.ATTACH_BLOCK_SEP, run_agent.ATTACH_SEP
+
+
+def _att(name, size, path=""):
+    return f"{name}{FS}{size}{FS}{path}"
+
+
+class AttachmentParseTests(unittest.TestCase):
+    def test_parses_attachment_block_after_body(self):
+        raw = (
+            f"S{FS}F{FS}D{FS}內文{FS}含分隔字元{GS}"
+            f"{_att('報價單.pdf', 12345, '/tmp/run/Celxpert/1/1-報價單.pdf')}{ASEP}"
+            f"{_att('image001.png', 2048, '/tmp/run/Celxpert/1/2-image001.png')}{ASEP}{RS}"
+            f"S2{FS}F{FS}D{FS}純內文{GS}{RS}"
+        )
+        mails = run_agent.parse_mail_output(raw)
+        self.assertEqual(len(mails), 2)
+        self.assertEqual(mails[0]["body"], f"內文{FS}含分隔字元")
+        self.assertEqual(mails[0]["attachments"], [
+            {"name": "報價單.pdf", "size": 12345, "path": "/tmp/run/Celxpert/1/1-報價單.pdf", "status": "saved"},
+            {"name": "image001.png", "size": 2048, "path": "/tmp/run/Celxpert/1/2-image001.png", "status": "saved"},
+        ])
+        self.assertEqual(mails[1]["body"], "純內文")
+        self.assertEqual(mails[1]["attachments"], [])
+
+    def test_unsaved_attachment_and_bad_size(self):
+        atts = run_agent.parse_attachment_block(f"{_att('a.docx', 10)}{ASEP}{_att('', 'x')}{ASEP}")
+        self.assertEqual(atts[0], {"name": "a.docx", "size": 10, "path": "", "status": "unsaved"})
+        self.assertEqual(atts[1]["name"], "attachment-2")
+        self.assertEqual(atts[1]["size"], 0)
+
+    def test_old_format_without_block_still_parses(self):
+        mails = run_agent.parse_mail_output(f"S{FS}F{FS}D{FS}B{RS}")
+        self.assertEqual(mails[0]["body"], "B")
+        self.assertEqual(mails[0]["attachments"], [])
+
+
+class AttachmentAppleScriptTests(unittest.TestCase):
+    def _script(self, **kwargs):
+        captured = {}
+
+        def fake_run(script, on_progress=None):
+            captured["script"] = script
+            return ""
+
+        with mock.patch.object(run_agent, "run_applescript", fake_run):
+            run_agent.fetch_unflagged_inbox_mails("X", **kwargs)
+        return captured["script"]
+
+    def test_saves_attachments_into_run_dir(self):
+        s = self._script(attachment_dir=Path("/Users/me/.mail-agent/attachments/20260101-000000/Celxpert"))
+        self.assertIn("repeat with att in (mail attachments of m)", s)
+        self.assertIn('set mailDir to "/Users/me/.mail-agent/attachments/20260101-000000/Celxpert/" & i', s)
+        self.assertIn("my ensureDir(mailDir)", s)
+        self.assertIn('attIndex & "-" & (my safeName(attName))', s)
+        self.assertIn("save att in (POSIX file savedPath)", s)
+        self.assertIn("if not (my isImageName(attName)) then", s)
+        self.assertIn('set imageExtensions to {".bmp", ".gif", ".heic", ".ico", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp"}', s)
+        self.assertIn("on isImageName(n)", s)
+        self.assertIn("on safeName(n)", s)
+        self.assertIn("on ensureDir(p)", s)
+        self.assertIn("& mailContent & GS & attInfo & RS", s)
+
+    def test_dry_run_lists_without_saving(self):
+        s = self._script(include_body=False, attachment_dir=None)
+        self.assertIn("mail attachments of m", s)
+        self.assertIn("file size of att", s)
+        self.assertNotIn("save att in", s)
+        self.assertNotIn("ensureDir(mailDir)", s)
+
+    def test_skip_attachments_emits_empty_block(self):
+        s = self._script(list_attachments=False)
+        self.assertNotIn("mail attachments", s)
+        self.assertIn('set attInfo to ""', s)
+        self.assertIn("& GS & attInfo & RS", s)
+
+    def test_account_slug(self):
+        self.assertEqual(run_agent.account_slug("Celxpert"), "Celxpert")
+        self.assertEqual(run_agent.account_slug("My Exchange / 公司"), "My_Exchange_公司")
+        self.assertEqual(run_agent.account_slug("///"), "account")
+
+
+class DocconvertCommandTests(unittest.TestCase):
+    def test_prefers_configured_executable(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = Path(d) / "docconvert"
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            self.assertEqual(run_agent.resolve_docconvert_command(str(exe), Path(d) / "none.mjs"), [str(exe)])
+
+    def test_falls_back_to_node_script(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "docconvert.mjs"
+            script.write_text("")
+            with mock.patch.object(run_agent.shutil, "which",
+                                   side_effect=lambda name: "/usr/local/bin/node" if name == "node" else None):
+                cmd = run_agent.resolve_docconvert_command(str(Path(d) / "missing"), script)
+        self.assertEqual(cmd, ["/usr/local/bin/node", str(script)])
+
+    def test_none_when_nothing_found(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(run_agent.shutil, "which", return_value=None):
+            self.assertIsNone(run_agent.resolve_docconvert_command(str(Path(d) / "missing"), Path(d) / "none.mjs"))
+        self.assertIn("MAIL_AGENT_SKIP_ATTACHMENTS", run_agent.docconvert_missing_hint())
+
+
+class ConvertAttachmentsTests(unittest.TestCase):
+    def _completed(self, stdout="", stderr="", returncode=0):
+        return run_agent.subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def test_calls_docconvert_without_vlm_and_maps_results(self):
+        paths = ["/tmp/x/1/1-a.pdf", "/tmp/x/1/2-b.zip"]
+        payload = {"files": [
+            {"source": "/private/tmp/x/1/1-a.pdf", "converter": "pdf", "ok": True, "markdown": "# a\n\n內容", "warnings": ["w"]},
+            {"source": "/private/tmp/x/1/2-b.zip", "converter": None, "ok": False, "markdown": "", "error": "不支援的副檔名「.zip」"},
+        ]}
+        calls = {}
+
+        def fake_run(argv, **kw):
+            calls["argv"], calls["kw"] = argv, kw
+            return self._completed(stdout=json.dumps(payload))
+
+        with mock.patch.object(run_agent.subprocess, "run", fake_run), \
+             mock.patch.object(run_agent.os.path, "realpath", lambda p: p.replace("/private/tmp", "/tmp")):
+            results = run_agent.convert_attachments(paths, command=["/bin/docconvert"], timeout=42)
+        self.assertEqual(calls["argv"], ["/bin/docconvert", "--json", "--quiet", *paths])
+        self.assertNotIn("--vlm", calls["argv"])
+        self.assertEqual(calls["kw"]["timeout"], 42)
+        self.assertTrue(results[paths[0]]["ok"])
+        self.assertEqual(results[paths[0]]["markdown"], "# a\n\n內容")
+        self.assertEqual(results[paths[0]]["warnings"], ["w"])
+        self.assertFalse(results[paths[1]]["ok"])
+        self.assertIsNone(results[paths[1]]["converter"])
+        self.assertIn("不支援", results[paths[1]]["error"])
+
+    def test_timeout_and_bad_output_do_not_raise(self):
+        paths = ["/tmp/a.pdf"]
+        with mock.patch.object(run_agent.subprocess, "run",
+                               side_effect=run_agent.subprocess.TimeoutExpired(cmd="x", timeout=1)):
+            res = run_agent.convert_attachments(paths, command=["dc"], timeout=1)
+        self.assertFalse(res[paths[0]]["ok"])
+        self.assertIn("1 秒", res[paths[0]]["error"])
+        with mock.patch.object(run_agent.subprocess, "run", return_value=self._completed(stdout="not json", stderr="boom")):
+            res = run_agent.convert_attachments(paths, command=["dc"])
+        self.assertIn("不是預期的 JSON", res[paths[0]]["error"])
+        self.assertIn("boom", res[paths[0]]["error"])
+        with mock.patch.object(run_agent.subprocess, "run", side_effect=FileNotFoundError("dc")):
+            res = run_agent.convert_attachments(paths, command=["dc"])
+        self.assertIn("無法執行", res[paths[0]]["error"])
+
+    def test_missing_converter(self):
+        with mock.patch.object(run_agent, "resolve_docconvert_command", return_value=None):
+            res = run_agent.convert_attachments(["/tmp/a.pdf"])
+        self.assertEqual(res["/tmp/a.pdf"]["error"], "找不到 docconvert")
+        self.assertEqual(run_agent.convert_attachments([], command=["dc"]), {})
+
+    def test_strip_title_line(self):
+        self.assertEqual(run_agent.strip_title_line("# 1-報價.pdf\n\n內容", "/tmp/1/1-報價.pdf"), "\n內容")
+        self.assertEqual(run_agent.strip_title_line("# 其他標題\n內容", "/tmp/1/1-報價.pdf"), "# 其他標題\n內容")
+        self.assertEqual(run_agent.strip_title_line("", "/tmp/1/1-a.pdf"), "")
+
+    def test_truncate_text(self):
+        self.assertEqual(run_agent.truncate_text("  short  ", 10), "short")
+        out = run_agent.truncate_text("x" * 50, 10)
+        self.assertTrue(out.startswith("x" * 10 + "\n…"))
+        self.assertIn("原長 50 字", out)
+        self.assertEqual(run_agent.truncate_text("x" * 50, 0), "x" * 50)
+
+
+class AttachAttachmentContentsTests(unittest.TestCase):
+    def _mail(self, atts):
+        return {"subject": "S", "sender": "F", "date_str": "D", "body": "B", "attachments": atts}
+
+    def test_statuses_and_truncation(self):
+        mail = self._mail([
+            {"name": "a.pdf", "size": 1, "path": "/tmp/1/1-a.pdf", "status": "saved"},
+            {"name": "logo.PNG", "size": 1, "path": "/tmp/1/2-logo.PNG", "status": "saved"},
+            {"name": "missing.docx", "size": 1, "path": "", "status": "unsaved"},
+            {"name": "x.zip", "size": 1, "path": "/tmp/1/4-x.zip", "status": "saved"},
+            {"name": "bad.xlsx", "size": 1, "path": "/tmp/1/5-bad.xlsx", "status": "saved"},
+        ])
+        converted = {
+            "/tmp/1/1-a.pdf": {"ok": True, "markdown": "y" * 100, "error": "", "warnings": [], "converter": "pdf"},
+            "/tmp/1/4-x.zip": {"ok": False, "markdown": "", "error": "不支援的副檔名「.zip」", "warnings": [], "converter": None},
+            "/tmp/1/5-bad.xlsx": {"ok": False, "markdown": "", "error": "檔頭不是 zip", "warnings": [], "converter": "sheet"},
+        }
+        progress = []
+        with mock.patch.object(run_agent, "convert_attachments", return_value=converted) as conv:
+            run_agent.attach_attachment_contents([mail], command=["dc"], max_chars=20, on_progress=progress.append)
+        conv.assert_called_once_with(["/tmp/1/1-a.pdf", "/tmp/1/4-x.zip", "/tmp/1/5-bad.xlsx"], command=["dc"])
+        statuses = [a["status"] for a in mail["attachments"]]
+        self.assertEqual(statuses, ["converted", "image", "unsaved", "unsupported", "failed"])
+        self.assertTrue(mail["attachments"][0]["content"].startswith("y" * 20))
+        self.assertIn("已截斷", mail["attachments"][0]["content"])
+        self.assertEqual(mail["attachments"][4]["error"], "檔頭不是 zip")
+        self.assertTrue(progress and "1 封" in progress[0] and "3 個附件" in progress[0])
+
+    def test_image_without_path_is_image_not_unsaved(self):
+        mail = self._mail([{"name": "image001.PNG", "size": 1, "path": "", "status": "unsaved"}])
+        with mock.patch.object(run_agent, "convert_attachments") as conv:
+            run_agent.attach_attachment_contents([mail], command=["dc"])
+        conv.assert_not_called()
+        self.assertEqual(mail["attachments"][0]["status"], "image")
+
+    def test_no_converter_marks_without_calling(self):
+        mail = self._mail([{"name": "a.pdf", "size": 1, "path": "/tmp/1/1-a.pdf", "status": "saved"}])
+        with mock.patch.object(run_agent, "convert_attachments") as conv:
+            run_agent.attach_attachment_contents([mail], command=None)
+        conv.assert_not_called()
+        self.assertEqual(mail["attachments"][0]["status"], "no-converter")
+
+
+class AttachmentPromptTests(unittest.TestCase):
+    def test_mail_for_prompt_appends_blocks_without_paths(self):
+        mail = {
+            "subject": "S", "sender": "F", "date_str": "D", "body": "內文",
+            "attachments": [
+                {"name": "報價.pdf", "size": 2048, "path": "/secret/path/1-報價.pdf", "status": "converted", "content": "# 報價\n金額 100"},
+                {"name": "logo.png", "size": 10, "path": "/secret/path/2-logo.png", "status": "image"},
+                {"name": "bad.xlsx", "size": 10, "path": "/secret/path/3-bad.xlsx", "status": "failed", "error": "x"},
+            ],
+        }
+        out = run_agent.mail_for_prompt(mail)
+        self.assertEqual(set(out), {"subject", "sender", "date_str", "body"})
+        self.assertIn("內文\n\n附件：報價.pdf (2.0 KB)\n# 報價\n金額 100", out["body"])
+        self.assertIn("附件：logo.png (10 B) — 圖片，依隱私政策不讀取內容", out["body"])
+        self.assertIn("附件：bad.xlsx (10 B) — 內容擷取失敗", out["body"])
+        self.assertNotIn("/secret/path", out["body"])
+
+    def test_mail_without_attachments_unchanged(self):
+        mail = {"subject": "S", "sender": "F", "date_str": "D", "body": "B"}
+        self.assertEqual(run_agent.mail_for_prompt(mail), mail)
+        prompt = run_agent._build_user_prompt([mail])
+        self.assertNotIn("附件", prompt)
+
+    def test_user_prompt_mentions_attachment_blocks(self):
+        mail = {"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                "attachments": [{"name": "a.pdf", "size": 1, "path": "/p", "status": "converted", "content": "C"}]}
+        prompt = run_agent._build_user_prompt([mail])
+        self.assertIn("「附件：<檔名>」區塊", prompt)
+        self.assertIn("附件：a.pdf", prompt)
+        self.assertNotIn('"/p"', prompt)
+
+    def test_format_size(self):
+        self.assertEqual(run_agent.format_size(512), "512 B")
+        self.assertEqual(run_agent.format_size(1536), "1.5 KB")
+        self.assertEqual(run_agent.format_size(3 * 1024 * 1024), "3.0 MB")
+
+
+class CleanupAttachmentDirTests(unittest.TestCase):
+    def test_removes_run_dir_but_keeps_failed_mail_dirs(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d) / "20260101-000000"
+            ok_dir, bad_dir = run_dir / "Celxpert" / "1", run_dir / "Celxpert" / "2"
+            ok_dir.mkdir(parents=True)
+            bad_dir.mkdir(parents=True)
+            (ok_dir / "1-a.pdf").write_text("x")
+            (bad_dir / "1-b.xlsx").write_text("x")
+            (bad_dir / "2-c.pdf").write_text("x")
+            mails = [("Celxpert", [
+                {"attachments": [{"name": "a.pdf", "path": str(ok_dir / "1-a.pdf"), "status": "converted"}]},
+                {"attachments": [
+                    {"name": "b.xlsx", "path": str(bad_dir / "1-b.xlsx"), "status": "failed"},
+                    {"name": "c.pdf", "path": str(bad_dir / "2-c.pdf"), "status": "converted"},
+                ]},
+            ])]
+            kept = run_agent.cleanup_attachment_dir(run_dir, mails)
+            self.assertEqual(kept, [bad_dir])
+            self.assertFalse(ok_dir.exists())
+            self.assertTrue((bad_dir / "1-b.xlsx").exists())
+            self.assertTrue((bad_dir / "2-c.pdf").exists())
+            self.assertTrue(run_dir.exists())
+
+    def test_all_ok_removes_everything(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d) / "run"
+            (run_dir / "A" / "1").mkdir(parents=True)
+            (run_dir / "A" / "1" / "1-a.pdf").write_text("x")
+            mails = [("A", [{"attachments": [{"name": "a.pdf", "path": str(run_dir / "A/1/1-a.pdf"), "status": "converted"}]}])]
+            self.assertEqual(run_agent.cleanup_attachment_dir(run_dir, mails), [])
+            self.assertFalse(run_dir.exists())
+            self.assertEqual(run_agent.cleanup_attachment_dir(run_dir, mails), [])  # 已不存在也不報錯
+
+
+class AttachmentMainFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patchers = [
+            mock.patch.object(run_agent, "CONFIG_FILE", self.root / "last_sync.json"),
+            mock.patch.object(run_agent, "ATTACHMENT_ROOT", self.root / "attachments"),
+        ]
+        for p in self.patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patchers:
+            p.stop()
+        self.tmp.cleanup()
+
+    def _report(self):
+        return run_agent.DailyBriefing(total_processed=1, briefings=[run_agent.EmailSummary(
+            subject="S", sender="F", date_str="D", summary="sum", action_items=[], strategy_advice="adv")])
+
+    def test_dry_run_lists_attachments_without_saving(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "",
+                  "attachments": [{"name": "報價.pdf", "size": 2048, "path": "", "status": "unsaved"}]}]
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails) as fetch, \
+             mock.patch.object(run_agent, "convert_attachments") as conv, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--dry-run", "--account", "Celxpert"]), 0)
+        conv.assert_not_called()
+        self.assertTrue(fetch.call_args.kwargs["list_attachments"])
+        self.assertIsNone(fetch.call_args.kwargs["attachment_dir"])
+        self.assertIn("報價.pdf (2.0 KB)", out.getvalue())
+        self.assertIn("共 1 個附件", out.getvalue())
+
+    def test_run_saves_converts_and_cleans_up(self):
+        def fake_fetch(account, **kwargs):
+            mail_dir = kwargs["attachment_dir"] / "1"
+            mail_dir.mkdir(parents=True)
+            (mail_dir / "1-a.pdf").write_text("pdf")
+            return [{"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                     "attachments": [{"name": "a.pdf", "size": 3, "path": str(mail_dir / "1-a.pdf"), "status": "saved"}]}]
+
+        def fake_convert(paths, command=None, timeout=None):
+            return {p: {"ok": True, "markdown": "內容", "error": "", "warnings": [], "converter": "pdf"} for p in paths}
+
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", side_effect=fake_fetch) as fetch, \
+             mock.patch.object(run_agent, "resolve_docconvert_command", return_value=["dc"]), \
+             mock.patch.object(run_agent, "convert_attachments", side_effect=fake_convert), \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=self._report()) as llm, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 0)
+        attachment_dir = fetch.call_args.kwargs["attachment_dir"]
+        self.assertEqual(attachment_dir.parent.parent, self.root / "attachments")
+        self.assertEqual(attachment_dir.name, "Celxpert")
+        sent = llm.call_args.args[0]
+        self.assertEqual(sent[0]["attachments"][0]["status"], "converted")
+        self.assertEqual(sent[0]["attachments"][0]["content"], "內容")
+        self.assertFalse((self.root / "attachments").exists() and any((self.root / "attachments").iterdir()))
+        self.assertIn("已擷取內容 1", out.getvalue())
+        self.assertTrue((self.root / "last_sync.json").exists())
+
+    def test_failed_conversion_is_kept_and_reported(self):
+        def fake_fetch(account, **kwargs):
+            mail_dir = kwargs["attachment_dir"] / "1"
+            mail_dir.mkdir(parents=True)
+            (mail_dir / "1-b.xlsx").write_text("x")
+            return [{"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                     "attachments": [{"name": "b.xlsx", "size": 1, "path": str(mail_dir / "1-b.xlsx"), "status": "saved"}]}]
+
+        def fake_convert(paths, command=None, timeout=None):
+            return {p: {"ok": False, "markdown": "", "error": "檔頭不是 zip", "warnings": [], "converter": "sheet"} for p in paths}
+
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", side_effect=fake_fetch) as fetch, \
+             mock.patch.object(run_agent, "resolve_docconvert_command", return_value=["dc"]), \
+             mock.patch.object(run_agent, "convert_attachments", side_effect=fake_convert), \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=self._report()), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 0)
+        kept = fetch.call_args.kwargs["attachment_dir"] / "1" / "1-b.xlsx"
+        self.assertTrue(kept.exists())
+        self.assertIn("擷取失敗 1", out.getvalue())
+        self.assertIn("b.xlsx: 檔頭不是 zip", out.getvalue())
+        self.assertIn(str(kept.parent), out.getvalue())
+
+    def test_missing_docconvert_lists_names_only(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                  "attachments": [{"name": "a.pdf", "size": 1, "path": str(self.root / "a.pdf"), "status": "saved"}]}]
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails), \
+             mock.patch.object(run_agent, "resolve_docconvert_command", return_value=None), \
+             mock.patch.object(run_agent, "convert_attachments") as conv, \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=self._report()) as llm, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 0)
+        conv.assert_not_called()
+        self.assertEqual(llm.call_args.args[0][0]["attachments"][0]["status"], "no-converter")
+        self.assertIn("找不到 docconvert", out.getvalue())
+        self.assertIn("未安裝 docconvert 1", out.getvalue())
+
+    def test_all_images_do_not_need_docconvert(self):
+        mails = [{"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                  "attachments": [{"name": "image001.png", "size": 1, "path": "", "status": "unsaved"}]}]
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=mails), \
+             mock.patch.object(run_agent, "resolve_docconvert_command") as resolve, \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", return_value=self._report()), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 0)
+        resolve.assert_not_called()
+        self.assertIn("全部是圖片或無法取出", out.getvalue())
+        self.assertNotIn("找不到 docconvert", out.getvalue())
+        self.assertIn("圖片略過 1", out.getvalue())
+
+    def test_skip_attachments_env(self):
+        with mock.patch.object(run_agent, "SKIP_ATTACHMENTS", True), \
+             mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", return_value=[]) as fetch, \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            run_agent.main([])
+        self.assertFalse(fetch.call_args.kwargs["list_attachments"])
+        self.assertIsNone(fetch.call_args.kwargs["attachment_dir"])
+        self.assertIn("MAIL_AGENT_SKIP_ATTACHMENTS", out.getvalue())
+
+    def test_llm_failure_still_cleans_attachments(self):
+        def fake_fetch(account, **kwargs):
+            mail_dir = kwargs["attachment_dir"] / "1"
+            mail_dir.mkdir(parents=True)
+            (mail_dir / "1-a.pdf").write_text("pdf")
+            return [{"subject": "S", "sender": "F", "date_str": "D", "body": "B",
+                     "attachments": [{"name": "a.pdf", "size": 3, "path": str(mail_dir / "1-a.pdf"), "status": "saved"}]}]
+
+        with mock.patch.object(run_agent, "fetch_unflagged_inbox_mails", side_effect=fake_fetch), \
+             mock.patch.object(run_agent, "resolve_docconvert_command", return_value=None), \
+             mock.patch.object(run_agent, "analyze_emails_with_llm", side_effect=RuntimeError("boom")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(run_agent.main(["--account", "Celxpert"]), 1)
+        self.assertEqual(list((self.root / "attachments").iterdir()), [])  # run 目錄已刪，只剩空的根目錄
+        self.assertFalse((self.root / "last_sync.json").exists())
+
 
 
 if __name__ == "__main__":

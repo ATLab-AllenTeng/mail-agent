@@ -268,6 +268,20 @@ cmd_status() {
   else
     echo "○ 最近執行    尚無紀錄"
   fi
+  # 附件轉換工具 docconvert（選配；沒有時只列附件檔名）
+  if [ "$(env_get MAIL_AGENT_SKIP_ATTACHMENTS)" = "1" ]; then
+    echo "－ 附件        已由 MAIL_AGENT_SKIP_ATTACHMENTS 關閉"
+  else
+    local dc; dc="$(env_get MAIL_AGENT_DOCCONVERT_BIN)"; dc="${dc:-${HOME}/.local/bin/docconvert}"
+    case "${dc}" in "~/"*) dc="${HOME}/${dc#\~/}" ;; esac
+    if [ -x "${dc}" ]; then grn "● docconvert  ${dc}（附件純文字抽取，不加 --vlm）"
+    elif [ -f "${HOME}/src/docconvert/bin/docconvert.mjs" ] && command -v node >/dev/null 2>&1; then
+      grn "● docconvert  node ${HOME}/src/docconvert/bin/docconvert.mjs（備援路徑）"
+    else ylw "○ docconvert  未安裝，附件只會列出檔名（git clone https://github.com/ATLab-AllenTeng/docconvert.git ~/src/docconvert && ~/src/docconvert/scripts/docconvert.sh install --skip-marker）"; fi
+  fi
+  local att_dir="${STATE_DIR}/attachments" kept
+  kept="$(find "${att_dir}" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${kept}" != "0" ] && ylw "● 保留的附件  ${kept} 個轉換失敗的附件留在 ${att_dir}（除錯用，可安心刪除）"
   local debug_dir="${STATE_DIR}/debug" n
   n="$(ls -1 "${debug_dir}" 2>/dev/null | wc -l | tr -d ' ')"
   [ "${n}" != "0" ] && ylw "● 解析失敗紀錄 ${n} 份（${debug_dir}，可安心刪除）"
